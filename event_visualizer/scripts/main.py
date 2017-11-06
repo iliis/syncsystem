@@ -20,7 +20,9 @@ H = 500
 LED_DELAY   = rospy.Duration.from_sec(0.001)
 LED_ON_TIME = rospy.Duration.from_sec(0.004)
 
-HIST_DURATION = rospy.Duration.from_sec(0.2)
+#HIST_DURATION = rospy.Duration.from_sec(0.2)
+HIST_DURATION = None # render everything
+
 
 
 
@@ -40,16 +42,13 @@ def ringbuffer(ring, write_idx):
 
 
 class TimeHistogram:
-    def __init__(self, width): #, bin_count):
-        self.width     = width # duration!
-        self.bin_count = W #bin_count
-
-        self.in_callback = False
+    def __init__(self, bin_count=W):
+        self.bin_count = bin_count
 
         self.mutex = threading.Lock()
 
         # derived parameters
-        self.bin_width = width/self.bin_count # duration
+        self.bin_width = total_duration/self.bin_count # duration
 
         # initialize bins
         self.bins_pos = [0 for i in range(self.bin_count)]
@@ -62,29 +61,9 @@ class TimeHistogram:
 
         self.info_text = sf.Text()
         self.info_text.font = font
-        self.info_text.string = u"{}uS per pixel".format((self.width/self.bin_count).nsecs/1000)
+        #self.info_text.string = u"{}uS per pixel".format((self.total_duration/self.bin_count).nsecs/1000)
+        self.info_text.string = u"unknown scale"
         self.info_text.position = sf.Vector2(5, H-self.info_text.character_size-5)
-
-    def event_callback(self, data):
-        with self.mutex:
-            self.in_callback = True
-            if self.latest_bin_t is None:
-                self.latest_bin_t = data.events[0].ts
-
-            for ev in data.events:
-                self.append(ev)
-            self.in_callback = False
-
-    def special_event_callback(self, data):
-        self.special_events.append(data)
-
-    def camera_frame_callback(self, data):
-        #print "got camera frame:", data.header.stamp
-        #print "latest timestamp:", self.latest_bin_t
-        #print "exposure time:", data.exp_time_us/1000, "ms"
-        #print "time difference:", (self.latest_bin_t - data.header.stamp).to_sec(), "sec"
-        #print "exposure time:", data.exp_time_us, "=", 1000000/data.exp_time_us, "FPS"
-        self.camera_frames.append(data)
 
     def shift_bins(self):
         self.write_idx += 1
@@ -105,35 +84,25 @@ class TimeHistogram:
         self.bins_pos[-1] = 0
         """
 
-    def append(self, event):
-        while not event.ts < self.latest_bin_t + self.bin_width:
-            # shift bins
-            #del self.bins_neg[0]
-            #del self.bins_pos[0]
-            #self.bins_neg.append(0)
-            #self.bins_pos.append(0)
-            self.shift_bins()
-
+    def append_event(self, event):
         if event.polarity:
             self.bins_pos[self.write_idx] += 1
         else:
             self.bins_neg[self.write_idx] += 1
 
-    def draw(self, target):
+    def draw(self, target, from_t, to_t):
 
         if self.latest_bin_t is None:
             return
 
+        total_duration = to_t - from_t
+
         with self.mutex:
-            if self.in_callback:
-                rospy.logwarn("draw() called while callback still active!")
             latest_bin_t = self.latest_bin_t
             bins_pos = list(self.bins_pos)
             bins_neg = list(self.bins_neg)
             write_idx = self.write_idx
 
-
-            from_t = latest_bin_t - self.width
 
             # filter out old events
             self.special_events = [e for e in self.special_events if e.ts+LED_DELAY+LED_ON_TIME >= from_t]
@@ -161,12 +130,12 @@ class TimeHistogram:
         #target.draw(arr)
 
         # shift everything so rightmost pixel is current time
-        tshift = 0 # (rospy.Time.now() - latest_bin_t) / self.width * width
+        tshift = 0 # (rospy.Time.now() - latest_bin_t) / total_duration * width
         #print(tshift)
 
 
         def width_from_duration(t):
-            return t / self.width * width
+            return t / total_duration * width
 
         def horiz_pos_from_time(t):
             return width_from_duration(t-from_t)- tshift
@@ -247,23 +216,63 @@ class TimeHistogram:
 
 
 
+class LiveDisplay:
+
+    def __init__(self, duration):
+        self.duration = duration
+        self.hist = TimeHistogram()
+
+    def event_callback(self, data):
+        with self.hist.mutex:
+            if self.latest_bin_t is None:
+                self.latest_bin_t = data.events[0].ts
+
+            for ev in data.events:
+                self.append_event(ev)
+
+    def append_event(self, event):
+        while not event.ts < self.latest_bin_t + self.bin_width:
+            self.hist.shift_bins()
+        self.hist.append_event(event)
+
+
+    def special_event_callback(self, data):
+        with self.hist.mutex:
+            self.hist.special_events.append(data)
+
+    def camera_frame_callback(self, data):
+        #print "got camera frame:", data.header.stamp
+        #print "latest timestamp:", self.latest_bin_t
+        #print "exposure time:", data.exp_time_us/1000, "ms"
+        #print "time difference:", (self.latest_bin_t - data.header.stamp).to_sec(), "sec"
+        #print "exposure time:", data.exp_time_us, "=", 1000000/data.exp_time_us, "FPS"
+        with self.hist.mutex:
+            self.hist.camera_frames.append(data)
+
+    def draw(self, target):
+        now = rospy.Time.now()
+        self.hist.draw(target, now-self.duration, now)
+
+
+
 
 if __name__ == '__main__':
 
     window = sf.RenderWindow(sf.VideoMode(W, H), u"Event Visualizer")
     window.vertical_synchronization = True
 
-    hist = TimeHistogram(HIST_DURATION)
+    #hist = TimeHistogram(HIST_DURATION)
+    disp = LiveDisplay()
 
     #for name, val in inspect.getmembers(window):
         #print(name)
 
     rospy.init_node('event_visualizer', anonymous=True)
 
-    rospy.Subscriber("/dvs/special_events", SpecialEvent, hist.special_event_callback)
-    rospy.Subscriber("/dvs/events", EventArray, hist.event_callback)
-    rospy.Subscriber("/camera/capture_info", CaptureInfo, hist.camera_frame_callback)
-    #rospy.Subscriber("/camera/image_raw", Image, hist.camera_frame_callback)
+    rospy.Subscriber("/dvs/special_events", SpecialEvent, disp.special_event_callback)
+    rospy.Subscriber("/dvs/events", EventArray, disp.event_callback)
+    rospy.Subscriber("/camera/capture_info", CaptureInfo, disp.camera_frame_callback)
+    #rospy.Subscriber("/camera/image_raw", Image, disp.camera_frame_callback)
 
     rospy.loginfo("listening for messages...")
 
@@ -286,7 +295,7 @@ if __name__ == '__main__':
         if not paused:
             window.clear(sf.Color(0,0,0))
 
-            hist.draw(window)
+            disp.draw(window)
 
             window.display()
 
