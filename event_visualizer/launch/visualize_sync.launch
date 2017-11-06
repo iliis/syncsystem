@@ -1,0 +1,12 @@
+<launch>
+  <!-- visualization -->
+  <node name="event_visualizer" pkg="event_visualizer" type="plot_all_events.py" output="screen">
+    <param name="synchronize_on_frames" value="False" />
+    <rosparam param="sources"> [
+        "/dvs/special_events/header/stamp",
+        "/camera/image_raw/header/stamp",
+        "/synchronized/camera/image_raw/header/stamp",
+    ] </rosparam>
+  </node>
+
+</launch>
