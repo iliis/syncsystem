@@ -2,6 +2,7 @@
 
 import itertools
 import datetime
+import math
 
 import rospy
 import rosbag
@@ -112,7 +113,7 @@ class SyncFrame:
 if __name__ == '__main__':
     #bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/startup_sync_40fps_2017-11-07-12-46-09.bag')
     #bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/blink_to_bluefox_per5_frames_2017-11-07-14-26-12.bag')
-    bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/blink_to_bluefox_60_300_frames_2017-11-08-17-15-14.bag')
+    bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/blink_fresh4_otherresetorder_2017-11-08-18-36-29.bag')
 
     fig, ax = plt.subplots()
 
@@ -149,8 +150,8 @@ if __name__ == '__main__':
 
         #colors.append( to_scaled_color(f.duration, 0.008, 0.009) )
         #colors.append( to_scaled_color(f.duration, 0.008, 0.009) )
+        colors.append( (0,0,1,1) )
         colors.append( (1,0,0,1) )
-        colors.append( (0,0,0,1) )
 
     collection = timestamps_to_lines(lines, -1)
     collection.set_color(colors)
@@ -164,6 +165,24 @@ if __name__ == '__main__':
         return cv_image.mean()
 
     #ax.add_collection(timestamps_to_lines([stamp(msg.header.stamp) for topic, msg, t in bag.read_messages(topics=['/camera/image_raw'])], 1))
+
+
+    image_events = [ (stamp(msg.header.stamp), mean_img_val(msg)) for topic, msg, t in bag.read_messages(topics=['/camera/image_raw']) ]
+
+    min_imgval = min([v[1] for v in image_events])
+    max_imgval = max([v[1] for v in image_events])
+    stddev_imgval = np.std([v[1] for v in image_events])
+    
+    print "image intensity: min:", min_imgval, "max:", max_imgval, "stddev:", stddev_imgval
+
+    ax.add_collection(to_lines(
+        image_events,
+        lambda m: m[0],
+        lambda m: to_scaled_color(m[1], min_imgval, max_imgval),
+        -2
+        ))
+
+    """
     ax.add_collection(to_lines(
         [msg for topic, msg, t in bag.read_messages(topics=['/camera/image_raw'])],
         lambda msg: stamp(msg.header.stamp),
@@ -171,15 +190,18 @@ if __name__ == '__main__':
         lambda m: to_scaled_color(mean_img_val(m), 0.6, 3),
         -2
         ))
+        """
 
     #ax.add_collection(timestamps_to_lines([stamp(msg.header.stamp) for topic, msg, t in bag.read_messages(topics=['/dvs/events'])], 2))
 
+    """
     for topic, msg, t in bag.read_messages(topics=['/camera/capture_info', '/camera/image_raw']):
         if topic == '/camera/capture_info':
             #print msg.header.stamp, t.to_sec()-start_t, msg.exp_time_us
             pass
         elif topic == '/camera/image_raw':
             print msg.header.stamp, mean_img_val(msg)
+    """
 
 
     print "rendering events..."
@@ -192,16 +214,23 @@ if __name__ == '__main__':
     last_image_avg = None
     for topic, msg, t in bag.read_messages(topics=['/camera/image_raw', '/dvs/special_events']):
         if topic == '/dvs/special_events':
+            if last_special_event is not None:
+                print "WARNING: unmatched special event"
             last_special_event = msg
         elif topic == '/camera/image_raw':
 
             avg = mean_img_val(msg)
 
-            if last_image_avg is not None and abs(last_image_avg[1] - avg) > 1.5:
+            if last_image_avg is not None and abs(last_image_avg[1] - avg) > stddev_imgval*1.5:
                 if avg-last_image_avg[1] > 0:
                     polarity = True
                 else:
                     polarity = False
+
+                #print "got transition of", abs(last_image_avg[1] - avg)
+
+                if last_image_transition is not None:
+                    print "WARNING: unmatched image transition"
 
                 last_image_transition = (last_image_avg[0], msg.header.stamp, polarity)
 

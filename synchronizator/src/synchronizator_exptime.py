@@ -2,6 +2,7 @@
 
 import datetime
 import math
+import threading
 
 import rospy
 import dynamic_reconfigure.client
@@ -24,17 +25,17 @@ class ExpTimeTest:
 
     TOLERANCE_US = 50 # difference between reported/configured exposure time and that measured by DAVIS is quite significant
 
-    LOW_EXP_TIME  = 8000
-    HIGH_EXP_TIME = 9000
+    EXP_TIME_DELTA = 1000 # change exposure time by this amount to identify frames
 
     def __init__(self):
+
+        self.mutex = threading.Lock()
+
         rospy.init_node('event_visualizer', anonymous=True)
 
         self.configclient = dynamic_reconfigure.client.Client('/camera')
 
         rospy.Subscriber("/dvs/special_events", SpecialEvent, self.special_event_callback)
-
-        #rospy.Subscriber("/camera/capture_info", CaptureInfo, self.image_callback)
 
         capture_info = message_filters.Subscriber("/camera/capture_info", CaptureInfo)
         camera_image = message_filters.Subscriber("/camera/image_raw", Image)
@@ -50,9 +51,16 @@ class ExpTimeTest:
 
         rospy.Service('change_exp_time', Trigger, self.change_trigger)
 
-        self.last_falling = rospy.Time.now()
 
-        self.currently_set_exp_time = 0
+        self.currently_set_exp_time = None
+
+
+
+        #self.special_events = []
+        #self.image_queue = []
+
+
+        self.last_falling = rospy.Time.now()
 
         # timestamp of first image received that matches new exposure time
         self.first_good_syncframe   = None
@@ -63,45 +71,52 @@ class ExpTimeTest:
         self.image_event_seq_offset = None
 
         self.sync_timestamps = {}
-        self.image_queue = []
+
 
     def matches_expected_exposure_time(self, exp_time_us):
+        if self.currently_set_exp_time is None:
+            return False
         return self.currently_set_exp_time - ExpTimeTest.TOLERANCE_US <= exp_time_us <= self.currently_set_exp_time + ExpTimeTest.TOLERANCE_US
 
     def special_event_callback(self, event):
-        if event.polarity == False:
-            self.last_falling = event.ts
-            return
+        with self.mutex:
+            #self.special_events.append(event)
+            #return
 
-        #print "got sync frame (exp_time:", (event.ts - self.last_falling).to_sec()*1000*1000, ", ts:", event.ts.to_sec(), ")"
-        if self.first_good_syncframe is None and self.matches_expected_exposure_time((event.ts - self.last_falling).nsecs/1000):
-            #print("MATCH!")
+            if event.polarity == False:
+                self.last_falling = event.ts
+                return
 
-            # todo: which point in time to take? middle of exposure?
-            #self.first_good_syncframe = self.last_falling
-            self.first_good_syncframe = event.ts
-            self.first_good_sync_seq  = event.header.seq
-            self.check_first_good()
+            #print "got sync frame (exp_time:", (event.ts - self.last_falling).to_sec()*1000*1000, ", ts:", event.ts.to_sec(), ")"
+            if self.first_good_syncframe is None and self.matches_expected_exposure_time((event.ts - self.last_falling).nsecs/1000):
+                #print("MATCH!")
 
-        if self.image_event_seq_offset is not None:
-            # middle of exposure
-            correct_ts = self.last_falling + (event.ts-self.last_falling)/2
-            self.sync_timestamps[int(math.floor(event.header.seq/2))] = correct_ts
+                # todo: which point in time to take? middle of exposure?
+                #self.first_good_syncframe = self.last_falling
+                self.first_good_syncframe = event.ts
+                self.first_good_sync_seq  = event.header.seq
+                self.check_first_good()
 
-            self.check_pending_buffers()
+            if self.image_event_seq_offset is not None:
+                # middle of exposure
+                correct_ts = self.last_falling + (event.ts-self.last_falling)/2
+                self.sync_timestamps[int(math.floor(event.header.seq/2))] = correct_ts
+
+                self.check_pending_buffers()
 
     def image_callback(self, info, img):
+        with self.mutex:
 
-        #print "got camera frame (exp_time:", img.exp_time_us, ", ts:", img.header.stamp.to_sec(), ")"
-        if self.first_good_cameraframe is None and self.matches_expected_exposure_time(info.exp_time_us):
-            #print("MATCH!")
-            self.first_good_cameraframe = info.header.stamp
-            self.first_good_image_seq   = img.header.seq
-            self.check_first_good()
+            #print "got camera frame (exp_time:", img.exp_time_us, ", ts:", img.header.stamp.to_sec(), ")"
+            if self.first_good_cameraframe is None and self.matches_expected_exposure_time(info.exp_time_us):
+                #print("MATCH!")
+                self.first_good_cameraframe = info.header.stamp
+                self.first_good_image_seq   = img.header.seq
+                self.check_first_good()
 
-        if self.image_event_seq_offset is not None:
-            self.image_queue.append((info, img))
-            self.check_pending_buffers()
+            if self.image_event_seq_offset is not None:
+                self.image_queue.append((info, img))
+                self.check_pending_buffers()
 
 
     def check_first_good(self):
@@ -147,31 +162,38 @@ class ExpTimeTest:
 
 
     def change_trigger(self, reg):
+        with self.mutex:
 
-        # toggle between two different exposure times
-        if self.currently_set_exp_time == ExpTimeTest.LOW_EXP_TIME:
-            t = ExpTimeTest.HIGH_EXP_TIME
-        else:
-            t = ExpTimeTest.LOW_EXP_TIME
+            if self.currently_set_exp_time is None:
+                rospy.LOGINFO("Not changing exposure time, haven't received any information yet.")
+                self.config = self.configclient.update_configuration({})
+                print "updated config:", self.config
+                return
 
-        self.config = self.configclient.update_configuration({'exp_time': t})
-        print "changed exposure time to", self.config['exp_time']/1000, "ms"
-        self.currently_set_exp_time = self.config['exp_time']
+            # toggle between two different exposure times
+            if self.currently_set_exp_time == ExpTimeTest.LOW_EXP_TIME:
+                t = ExpTimeTest.HIGH_EXP_TIME
+            else:
+                t = ExpTimeTest.LOW_EXP_TIME
 
-        self.first_good_syncframe   = None
-        self.first_good_cameraframe = None
+            self.config = self.configclient.update_configuration({'exp_time': t})
+            print "changed exposure time to", self.config['exp_time']/1000, "ms"
+            self.currently_set_exp_time = self.config['exp_time']
 
-        self.first_good_sync_seq    = None
-        self.first_good_image_seq   = None
-        self.image_event_seq_offset = None
+            self.first_good_syncframe   = None
+            self.first_good_cameraframe = None
 
-        self.sync_timestamps = {}
-        self.image_queue = []
+            self.first_good_sync_seq    = None
+            self.first_good_image_seq   = None
+            self.image_event_seq_offset = None
 
-        response = TriggerResponse()
-        response.success = True
-        response.message = ""
-        return response
+            self.sync_timestamps = {}
+            self.image_queue = []
+
+            response = TriggerResponse()
+            response.success = True
+            response.message = ""
+            return response
 
 
 
