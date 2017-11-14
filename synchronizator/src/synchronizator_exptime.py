@@ -3,6 +3,7 @@
 import datetime
 import math
 import threading
+import numpy as np
 
 import rospy
 import dynamic_reconfigure.client
@@ -15,19 +16,45 @@ import message_filters
 
 
 # TODO: prevent changes to exposure time while waiting for previous change
-# TODO: timeout wait for exp time change
-# TODO: detect significant changes in timing offset (for example due to dropped frame)
 
 
+################################################################################
+# Helper Functions
 
+def prevnext(l):
+    it = iter(l)
+    try:
+        last_obj = it.next()
+        while True:
+            next_obj = it.next()
+            yield last_obj, next_obj
+            last_obj = next_obj
+    except StopIteration:
+        pass
+
+#-------------------------------------------------------------------------------
+
+def floor_rest(f):
+    i = int(math.floor(f))
+    return i, f-i
+
+
+################################################################################
 
 class ExpTimeTest:
+
+    # PARAMETERS
+    #############################################
 
     TOLERANCE_US = 50 # [us] difference between reported/configured exposure time and that measured by DAVIS is quite significant
 
     EXP_TIME_DELTA = 1000 # [us] change exposure time by this amount to identify frames
 
     TIMEOUT = rospy.Duration.from_sec(2) # timeout for waiting for data/synchronized frames etc.
+
+    OFFSET_HISTORY_SIZE = 10 # keep offset of last N frames to detect dropped frames and such
+
+    #---------------------------------------------------------------------------
 
     def __init__(self):
 
@@ -50,41 +77,26 @@ class ExpTimeTest:
         self.image_pub     = rospy.Publisher("/synchronized/camera/image_raw", Image, queue_size=2)
 
 
+        self.original_exp_time = None
 
-        rospy.Service('resynchronize', Trigger, self.start_synchronization)
+        #rospy.Service('resynchronize', Trigger, self.start_synchronization)
 
         self.timeout_timer = None
 
 
         self.reset_sync()
 
-    def restart_timeout(self):
-        if self.timeout_timer is not None:
-            self.timeout_timer.shutdown()
-
-        self.timeout_timer = rospy.Timer(self.TIMEOUT, self.timeout, oneshot=True)
-
-    def reset_sync(self):
-        with self.mutex:
-            self.currently_set_exp_time = None
-            self.original_exp_time = None
-
-            self.last_falling = None
-
-            self.special_events = []
-            self.image_queue = []
-
-            self.sync_state = 'wait_data'
-            rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
-
-            self.got_new_data = False
-
+    ############################################################################
+    # CALLBACK THREADS
+    # The following functions all run in their own thread!
 
     def timeout(self, event):
-        rospy.logerr("TIMEOUT")
+        with self.mutex:
+            rospy.logerr("TIMEOUT")
 
-        # no mutex, otherwise reset_sync will block
-        self.reset_sync() # TODO: handle this in main loop?
+            self.reset_sync() # TODO: handle this in main loop?
+
+    #---------------------------------------------------------------------------
 
     def special_event_callback(self, event):
         with self.mutex:
@@ -119,6 +131,8 @@ class ExpTimeTest:
                 self.check_pending_buffers()
             """
 
+    #---------------------------------------------------------------------------
+
     def image_callback(self, info, img):
         with self.mutex:
             self.image_queue.append( (info, img) )
@@ -139,6 +153,8 @@ class ExpTimeTest:
             if self.currently_set_exp_time is None:
                 self.start_synchronization(None)
             """
+
+    #---------------------------------------------------------------------------
 
 
     """
@@ -185,37 +201,70 @@ class ExpTimeTest:
     """
 
 
-    def start_synchronization(self, reg):
-        with self.mutex:
-            rospy.loginfo("triggering synchronization")
+    ############################################################################
+    # MAIN THREAD
+    # the following functions shall only be called from the main-loop
+    # (or while holding the mutex)
 
-            if self.currently_set_exp_time is None:
-                self.config = self.configclient.update_configuration({})
-                self.currently_set_exp_time = self.config['exp_time']
-                self.original_exp_time = self.currently_set_exp_time
+    def restart_timeout(self):
+        if self.timeout_timer is not None:
+            self.timeout_timer.shutdown()
 
-            # toggle between two different exposure times
-            if self.currently_set_exp_time == self.original_exp_time:
-                # use something that isn't too close to the limits (0 or 10ms)
-                if self.currently_set_exp_time < self.EXP_TIME_DELTA*2:
-                    t = self.currently_set_exp_time + self.EXP_TIME_DELTA
-                else:
-                    t = self.currently_set_exp_time - self.EXP_TIME_DELTA
-            else:
-                # go back to original exposure time
-                t = self.original_exp_time
+        self.timeout_timer = rospy.Timer(self.TIMEOUT, self.timeout, oneshot=True)
 
-            self.config = self.configclient.update_configuration({'exp_time': t})
-            rospy.loginfo("changed exposure time to {} ms".format(self.config['exp_time']/1000.0))
+    #---------------------------------------------------------------------------
+
+    def reset_sync(self):
+        self.currently_set_exp_time = None
+
+        self.last_falling = None
+
+        self.special_events = [] # type: List[Tuple[rospy.Time, rospy.Duration]]
+        self.image_queue = []    # type: List[Tuple[CaptureInfo, Image]]
+        # last N offsets to detect lost frames
+        self.time_offset_hist = [(None,None)] * self.OFFSET_HISTORY_SIZE # type: List[(stamp, duration)]
+        self.time_offset_hist_idx = -self.OFFSET_HISTORY_SIZE
+
+
+        self.sync_state = 'wait_data'
+        rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
+
+        self.got_new_data = False
+
+    #---------------------------------------------------------------------------
+
+    def start_synchronization(self):
+        self.restart_timeout()
+        rospy.loginfo("triggering synchronization")
+
+        if self.currently_set_exp_time is None:
+            self.config = self.configclient.update_configuration({})
             self.currently_set_exp_time = self.config['exp_time']
+            self.original_exp_time = self.currently_set_exp_time
+
+        # toggle between two different exposure times
+        if self.currently_set_exp_time == self.original_exp_time:
+            # use something that isn't too close to the limits (0 or 10ms)
+            if self.currently_set_exp_time < self.EXP_TIME_DELTA*2:
+                t = self.currently_set_exp_time + self.EXP_TIME_DELTA
+            else:
+                t = self.currently_set_exp_time - self.EXP_TIME_DELTA
+        else:
+            # go back to original exposure time
+            t = self.original_exp_time
+
+        self.config = self.configclient.update_configuration({'exp_time': t})
+        rospy.loginfo("changed exposure time to {} ms".format(self.config['exp_time']/1000.0))
+        self.currently_set_exp_time = self.config['exp_time']
 
 
 
-            response = TriggerResponse()
-            response.success = True
-            response.message = ""
-            return response
+        response = TriggerResponse()
+        response.success = True
+        response.message = ""
+        return response
 
+    #---------------------------------------------------------------------------
 
     def match_exp_time(self, time_us, ref_us=None):
         if ref_us is None:
@@ -223,6 +272,7 @@ class ExpTimeTest:
 
         return ref_us - ExpTimeTest.TOLERANCE_US <= time_us <= ref_us + ExpTimeTest.TOLERANCE_US
 
+    #---------------------------------------------------------------------------
 
     def check_for_exp_time_change(self):
         assert len(self.image_queue) > 0
@@ -273,19 +323,78 @@ class ExpTimeTest:
 
         return True
 
-
+    #---------------------------------------------------------------------------
 
     def publish(self):
-        while len(self.image_queue) > 0 and len(self.special_events):
+        while len(self.image_queue) > 0 and len(self.special_events) > 0:
 
             (info, img)       = self.image_queue.pop(0)
             (stamp, duration) = self.special_events.pop(0)
+            offset = info.header.stamp - stamp
+
+            # check if match is still good
 
             if not self.match_exp_time(info.exp_time_us, duration.nsecs/1000):
+                # TODO: take offset by single frame into account!
                 rospy.logwarn("publishing image with significantly different exposure time than measured: " \
                         + "{} ms reported by capture_info, {} ms measured by DAVIS.".format(info.exp_time_us/1000.0, duration.to_sec()*1000))
 
-            rospy.loginfo("published synced image pair. offset: {} ms".format((info.header.stamp-stamp).to_sec()*1000))
+            # do we have a good amount of past data?
+            # otherwise just go on and hope for the best
+            if self.time_offset_hist_idx >= 0:
+                offset_mean   = np.median([o for _, o in self.time_offset_hist])
+                offset_stddev = np.std(   [o for _, o in self.time_offset_hist])
+
+                fps_mean = np.median([(b-a).to_sec() for (a,_),(b,_) in prevnext(self.time_offset_hist)])
+
+                #rospy.loginfo("Offset: mean: {} ms, stddev: {} ms, FPS: mean: {}".format(offset_mean*1000, offset_stddev*1000, 1/fps_mean))
+
+                if abs(offset.to_sec()-offset_mean) > offset_stddev*10+10: # add a const. term as stddev can get quite small
+                    rospy.logwarn("Unexpected offset measured, last {} were {} ms (+/- {}), but this is {} ms" \
+                            .format(self.OFFSET_HISTORY_SIZE, offset_mean*1000, offset_stddev*1000, offset.to_sec()*1000))
+
+                    # assume we've lost some frames
+                    offset_frames, offset_fraction = floor_rest( (offset.to_sec() - offset_mean) / fps_mean )
+                    if offset_fraction < 0.1: # TODO: this is just a guess
+                        rospy.logwarn("Detected loss of {} frames.".format(abs(offset_frames)))
+                        if abs(offset_frames) >= self.OFFSET_HISTORY_SIZE/2:
+                            rospy.logerr("This seems a bit high, aborting.")
+                            return False
+
+                        # try to delete corresponding frames from other camera
+                        if offset_frames > 0:
+                            rospy.loginfo("Lost images.")
+                            if offset_frames > len(self.special_events):
+                                self.special_events = []
+                            else:
+                                del self.special_events[0:offset_frames]
+                        elif offset_frames < 0:
+                            rospy.logwarn("Lost special events. Please check sync cable!")
+                            if offset_frames > len(self.image_queue):
+                                self.image_queue = []
+                            else:
+                                del self.image_queue[0:offset_frames]
+                        else:
+                            rospy.loginfo("ignoring offset fraction of {}".format(offset_fraction))
+
+
+                        continue # try again
+                    else:
+                        if abs(offset_frames) > 0:
+                            rospy.logerr("offset is off by a non-integer fraction of a frame. Can't recover, try to sync again.")
+                            return False
+
+            # keep track of last N frames
+
+            self.time_offset_hist_idx += 1
+            if self.time_offset_hist_idx >= self.OFFSET_HISTORY_SIZE:
+                self.time_offset_hist_idx = 0
+
+            self.time_offset_hist[self.time_offset_hist_idx] = ( stamp, offset.to_sec() )
+
+            # actually publish synchronized image
+
+            rospy.loginfo("published synced image pair. offset: {} ms.".format(offset.to_sec()*1000))
 
             info.header.stamp = stamp
             img .header.stamp = stamp
@@ -293,47 +402,60 @@ class ExpTimeTest:
             self.image_pub.publish(img)
             self.capt_info_pub.publish(info)
 
+        return True
 
+    #---------------------------------------------------------------------------
+
+    # main state-machine
     def main(self):
         while not rospy.is_shutdown():
+            with self.mutex:
 
-            if self.got_new_data:
-                self.got_new_data = False
+                if self.got_new_data:
+                    self.got_new_data = False
 
-                if self.sync_state == 'wait_data':
-                    # we're waiting for data from both cameras
-                    if len(self.image_queue) > 0 and len(self.special_events) > 0:
-                        self.start_synchronization(None)
-                        self.restart_timeout()
-                        self.sync_state = 'wait_match1'
-                        self.image_queue = []
-                        self.special_events = []
+                    if self.sync_state == 'wait_data':
+                        # we're waiting for data from both cameras
+                        if len(self.image_queue) > 0 and len(self.special_events) > 0:
+                            self.start_synchronization()
+                            self.sync_state = 'wait_match1'
 
-                        rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
+                            # throw data away, as it might be bad. Also, it
+                            # would mess up check_for_exp_time_change() as it
+                            # assumes the oldest entries have a different
+                            # exposure time
+                            self.image_queue = []
+                            self.special_events = []
 
-                elif self.sync_state == 'wait_match1':
-                    if self.check_for_exp_time_change():
-                        self.start_synchronization(None)
-                        self.restart_timeout()
-                        self.sync_state = 'wait_match2'
-                        rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
+                            rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
 
-                elif self.sync_state == 'wait_match2':
-                    if self.check_for_exp_time_change():
-                        self.timeout_timer.shutdown()
-                        self.sync_state = 'publish'
-                        rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
+                    elif self.sync_state == 'wait_match1':
+                        if self.check_for_exp_time_change():
+                            self.start_synchronization()
+                            self.sync_state = 'wait_match2'
+                            rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
 
-                elif self.sync_state == 'publish':
-                    self.publish()
+                    elif self.sync_state == 'wait_match2':
+                        if self.check_for_exp_time_change():
+                            self.timeout_timer.shutdown()
+                            self.sync_state = 'publish'
+                            rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
 
-                else:
-                    raise Exception("Invalid State '{}'. This should not happen, please report it.".format(self.sync_state))
+                    elif self.sync_state == 'publish':
+                        if not self.publish():
+                            self.reset_sync()
+
+                            rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
+
+                    else:
+                        raise Exception("Invalid State '{}'. This should not happen, please report it.".format(self.sync_state))
 
             rospy.sleep(rospy.Duration.from_sec(0.1))
 
-
+################################################################################
 
 if __name__ == "__main__":
     e = ExpTimeTest()
     e.main()
+
+################################################################################
