@@ -83,6 +83,9 @@ class ExpTimeTest:
 
         self.timeout_timer = None
 
+        self.skip_initial_image_count = rospy.get_param('~skip_first_frames', 0)
+        rospy.loginfo("skipping initial {} frames".format(self.skip_initial_image_count))
+
 
         self.reset_sync()
 
@@ -436,7 +439,7 @@ class ExpTimeTest:
 
             # actually publish synchronized image
 
-            rospy.loginfo("published synced image pair. offset: {} ms.".format(offset.to_sec()*1000))
+            #rospy.loginfo("published synced image pair. offset: {} ms.".format(offset.to_sec()*1000))
 
             info.header.stamp = stamp
             img .header.stamp = stamp
@@ -459,6 +462,14 @@ class ExpTimeTest:
                     if self.sync_state == 'wait_data':
                         # we're waiting for data from both cameras
                         if len(self.image_queue) > 0 and len(self.special_events) > 0:
+
+                            if self.skip_initial_image_count > 0:
+                                rospy.loginfo("skipping {} frame[s]".format(len(self.image_queue)))
+                                self.skip_initial_image_count -= len(self.image_queue)
+                                self.image_queue = []
+                                self.special_events = []
+                                continue
+
 
                             self.update_original_exp_time()
                             if not self.verify_exp_time_measurements():
