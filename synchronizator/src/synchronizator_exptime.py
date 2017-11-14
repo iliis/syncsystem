@@ -59,6 +59,7 @@ class ExpTimeTest:
     def __init__(self):
 
         self.mutex = threading.Lock()
+        self.got_new_data = threading.Event()
 
         rospy.init_node('event_visualizer', anonymous=True)
 
@@ -111,7 +112,7 @@ class ExpTimeTest:
                 stamp    = self.last_falling.ts + duration/2 # middle of frame
 
                 self.special_events.append( (stamp, duration) )
-                self.got_new_data = True
+                self.got_new_data.set()
 
             """
                 return
@@ -139,7 +140,7 @@ class ExpTimeTest:
     def image_callback(self, info, img):
         with self.mutex:
             self.image_queue.append( (info, img) )
-            self.got_new_data = True
+            self.got_new_data.set()
 
             """
             #print "got camera frame (exp_time:", img.exp_time_us, ", ts:", img.header.stamp.to_sec(), ")"
@@ -232,7 +233,7 @@ class ExpTimeTest:
         self.sync_state = 'wait_data'
         rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
 
-        self.got_new_data = False
+        self.got_new_data.clear()
 
     #---------------------------------------------------------------------------
 
@@ -306,8 +307,8 @@ class ExpTimeTest:
     #---------------------------------------------------------------------------
 
     def check_for_exp_time_change(self):
-        assert len(self.image_queue) > 0
-        assert len(self.special_events) > 0
+        if len(self.image_queue) == 0 or len(self.special_events) == 0:
+            return False
 
         first_img_exp_time = self.image_queue[0][0].exp_time_us
         if self.match_exp_time(first_img_exp_time):
@@ -454,61 +455,62 @@ class ExpTimeTest:
     # main state-machine
     def main(self):
         while not rospy.is_shutdown():
+            self.got_new_data.wait(timeout=self.TIMEOUT.to_sec())
+            if not self.got_new_data.is_set():
+                rospy.logwarn("Timeout in main thread while waiting for data.")
+                continue
+
             with self.mutex:
+                self.got_new_data.clear()
 
-                if self.got_new_data:
-                    self.got_new_data = False
+                if self.sync_state == 'wait_data':
+                    # we're waiting for data from both cameras
+                    if len(self.image_queue) > 0 and len(self.special_events) > 0:
 
-                    if self.sync_state == 'wait_data':
-                        # we're waiting for data from both cameras
-                        if len(self.image_queue) > 0 and len(self.special_events) > 0:
-
-                            if self.skip_initial_image_count > 0:
-                                rospy.loginfo("skipping {} frame[s]".format(len(self.image_queue)))
-                                self.skip_initial_image_count -= len(self.image_queue)
-                                self.image_queue = []
-                                self.special_events = []
-                                continue
-
-
-                            self.update_original_exp_time()
-                            if not self.verify_exp_time_measurements():
-                                return # fatal, shut-down...
-
-                            self.start_synchronization()
-                            self.sync_state = 'wait_match1'
-
-                            # throw data away, as it might be bad. Also, it
-                            # would mess up check_for_exp_time_change() as it
-                            # assumes the oldest entries have a different
-                            # exposure time
+                        if self.skip_initial_image_count > 0:
+                            rospy.loginfo("skipping {} frame[s]".format(len(self.image_queue)))
+                            self.skip_initial_image_count -= len(self.image_queue)
                             self.image_queue = []
                             self.special_events = []
+                            continue
 
-                            rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
 
-                    elif self.sync_state == 'wait_match1':
-                        if self.check_for_exp_time_change():
-                            self.start_synchronization()
-                            self.sync_state = 'wait_match2'
-                            rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
+                        self.update_original_exp_time()
+                        if not self.verify_exp_time_measurements():
+                            return # fatal, shut-down...
 
-                    elif self.sync_state == 'wait_match2':
-                        if self.check_for_exp_time_change():
-                            self.timeout_timer.shutdown()
-                            self.sync_state = 'publish'
-                            rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
+                        self.start_synchronization()
+                        self.sync_state = 'wait_match1'
 
-                    elif self.sync_state == 'publish':
-                        if not self.publish():
-                            self.reset_sync()
+                        # throw data away, as it might be bad. Also, it
+                        # would mess up check_for_exp_time_change() as it
+                        # assumes the oldest entries have a different
+                        # exposure time
+                        self.image_queue = []
+                        self.special_events = []
 
-                            rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
+                        rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
 
-                    else:
-                        raise Exception("Invalid State '{}'. This should not happen, please report it.".format(self.sync_state))
+                elif self.sync_state == 'wait_match1':
+                    if self.check_for_exp_time_change():
+                        self.start_synchronization()
+                        self.sync_state = 'wait_match2'
+                        rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
 
-            rospy.sleep(rospy.Duration.from_sec(0.1))
+                elif self.sync_state == 'wait_match2':
+                    if self.check_for_exp_time_change():
+                        self.timeout_timer.shutdown()
+                        self.sync_state = 'publish'
+                        rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
+
+                elif self.sync_state == 'publish':
+                    if not self.publish():
+                        self.reset_sync()
+
+                        rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
+
+                else:
+                    raise Exception("Invalid State '{}'. This should not happen, please report it.".format(self.sync_state))
 
 ################################################################################
 
