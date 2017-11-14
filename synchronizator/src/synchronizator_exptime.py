@@ -66,10 +66,10 @@ class ExpTimeTest:
 
         rospy.Subscriber("/dvs/special_events", SpecialEvent, self.special_event_callback)
 
-        capture_info = message_filters.Subscriber("/camera/capture_info", CaptureInfo)
-        camera_image = message_filters.Subscriber("/camera/image_raw", Image)
+        self.capture_info_sub = message_filters.Subscriber("/camera/capture_info", CaptureInfo)
+        self.camera_image_sub = message_filters.Subscriber("/camera/image_raw", Image)
 
-        self.synced_cam_info = message_filters.TimeSynchronizer([capture_info, camera_image], 10)
+        self.synced_cam_info = message_filters.TimeSynchronizer([self.capture_info_sub, self.camera_image_sub], 10)
         self.synced_cam_info.registerCallback(self.image_callback)
 
 
@@ -233,14 +233,16 @@ class ExpTimeTest:
 
     #---------------------------------------------------------------------------
 
-    def start_synchronization(self):
-        self.restart_timeout()
-        rospy.loginfo("triggering synchronization")
-
+    def update_original_exp_time(self):
         if self.currently_set_exp_time is None:
             self.config = self.configclient.update_configuration({})
             self.currently_set_exp_time = self.config['exp_time']
             self.original_exp_time = self.currently_set_exp_time
+            #rospy.loginfo("remembering original exposure time of {} ms".format(self.original_exp_time/1000.0))
+
+    def start_synchronization(self):
+        self.restart_timeout()
+        rospy.loginfo("triggering synchronization")
 
         # toggle between two different exposure times
         if self.currently_set_exp_time == self.original_exp_time:
@@ -274,16 +276,44 @@ class ExpTimeTest:
 
     #---------------------------------------------------------------------------
 
+    def verify_exp_time_measurements(self):
+        # check if we actually measure the exposure time we expect
+        assert len(self.image_queue) > 0
+        assert len(self.special_events) > 0
+
+
+        duration_mean = np.median([ci.exp_time_us for ci,_ in self.image_queue])
+        measured_mean = np.median([d.nsecs/1000.0 for _, d in self.special_events])
+
+        #rospy.loginfo("current exposure time: {} us, measured: {} us".format(duration_mean, measured_mean))
+
+        if not self.match_exp_time(duration_mean, measured_mean):
+            rospy.logfatal("Invalid exposure time: {} reports an exposure time of {} us, but we measured {} us".format(
+                self.capture_info_sub.name, duration_mean, measured_mean))
+            return False
+
+        if not self.match_exp_time(duration_mean, self.original_exp_time):
+            rospy.logfatal("Invalid exposure time: {} reports an exposure time of {} us, but dynamic reconfiguration on {} says exp_time should be {} us".format(
+                self.capture_info_sub.name, duration_mean, self.configclient.name, self.original_exp_time))
+            return False
+
+        return True
+
+
+    #---------------------------------------------------------------------------
+
     def check_for_exp_time_change(self):
         assert len(self.image_queue) > 0
         assert len(self.special_events) > 0
 
-        if self.match_exp_time(self.image_queue[0][0].exp_time_us):
+        first_img_exp_time = self.image_queue[0][0].exp_time_us
+        if self.match_exp_time(first_img_exp_time):
             # this should not happen, but could if changing the exposure time failed or was done twice in too rapid succession
             rospy.logerr("Failed to match exposure time change: Oldest image in queue already has new exposure time.")
             return False
 
-        if self.match_exp_time(self.special_events[0][1].nsecs/1000):
+        first_event_exp_time = self.special_events[0][1].nsecs/1000.0
+        if self.match_exp_time(first_event_exp_time):
             rospy.logerr("Failed to match exposure time change: Oldest events in queue already show new exposure time.")
             return False
 
@@ -299,6 +329,12 @@ class ExpTimeTest:
 
                 match_img_idx = idx
                 break
+            elif not self.match_exp_time(info.exp_time_us, first_img_exp_time):
+                rospy.logerr("Got unexpected exposure time of {} ms. Expected either {} ms or {} ms.".format(
+                    info.exp_time_us/1000.0, self.currently_set_exp_time/1000.0, first_img_exp_time/1000.0
+                    ))
+                self.reset_sync()
+                return False
 
         if not match_img_idx:
             return False # wait for more frames
@@ -307,9 +343,15 @@ class ExpTimeTest:
 
         match_event_idx = None
         for idx, (stamp, duration) in enumerate(self.special_events):
-            if self.match_exp_time(duration.nsecs/1000):
+            if self.match_exp_time(duration.nsecs/1000.0):
                 match_event_idx = idx
                 break
+            elif not self.match_exp_time(duration.nsecs/1000.0, first_event_exp_time):
+                rospy.logerr("Measured unexpected exposure time of {} ms. Expected either {} ms or {} ms.".format(
+                    duration.nsecs/1000000.0, self.currently_set_exp_time/1000.0, first_event_exp_time/1000.0
+                    ))
+                self.reset_sync()
+                return False
 
         if not match_event_idx:
             return False # wait for more special events
@@ -417,6 +459,11 @@ class ExpTimeTest:
                     if self.sync_state == 'wait_data':
                         # we're waiting for data from both cameras
                         if len(self.image_queue) > 0 and len(self.special_events) > 0:
+
+                            self.update_original_exp_time()
+                            if not self.verify_exp_time_measurements():
+                                return # fatal, shut-down...
+
                             self.start_synchronization()
                             self.sync_state = 'wait_match1'
 
