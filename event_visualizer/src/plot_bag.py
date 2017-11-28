@@ -109,8 +109,27 @@ class SyncFrame:
         self.ros_end_t   = ros_end_t
         #print self.duration*1000
 
+def render_sync_events(events, offset=0, use_internal_timestamp=True):
 
-if __name__ == '__main__':
+    lines = []
+    colors = []
+    for event in events:
+        if use_internal_timestamp:
+            lines.append(stamp(event.ts))
+        else:
+            lines.append(stamp(event.header.stamp))
+
+        if event.polarity:
+            colors.append( (0,0,1,1) )
+        else:
+            colors.append( (1,0,0,1) )
+
+    collection = timestamps_to_lines(lines, offset)
+    collection.set_color(colors)
+    return collection
+
+
+def render_blinking_led():
     #bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/startup_sync_40fps_2017-11-07-12-46-09.bag')
     #bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/blink_to_bluefox_per5_frames_2017-11-07-14-26-12.bag')
     bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/blink_fresh4_otherresetorder_2017-11-08-18-36-29.bag')
@@ -254,3 +273,28 @@ if __name__ == '__main__':
     ax.margins(.1)
 
     plt.show()
+
+
+
+if __name__ == '__main__':
+    bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/outside2_2017-11-14-14-13-08.bag')
+
+    fig, ax = plt.subplots()
+
+    start_t = bag.get_start_time()
+    end_t   = bag.get_end_time()
+
+    bridge = CvBridge()
+
+    ax.add_collection(timestamps_to_lines([stamp(msg.header.stamp) for topic, msg, t in bag.read_messages(topics=['/camera/image_raw'])], 0))
+    #ax.add_collection(timestamps_to_lines([stamp(msg.ts          ) for topic, msg, t in bag.read_messages(topics=['/dvs/special_events'])], 1))
+    ax.add_collection(render_sync_events([msg for _,msg,_ in bag.read_messages(topics=['/dvs/special_events'])], 1))
+    ax.add_collection(timestamps_to_lines([stamp(msg.header.stamp) for topic, msg, t in bag.read_messages(topics=['/synchronized/camera/image_raw'])], 2))
+    #ax.add_collection(timestamps_to_lines([stamp(msg.header.stamp) for topic, msg, t in bag.read_messages(topics=['/cam_remapped_to_ev'])], 3))
+
+    bag.close()
+    ax.autoscale()
+    ax.margins(.1)
+    plt.show()
+
+

@@ -7,16 +7,16 @@ import datetime
 # use internal timestamps instead of rosbag ones
 
 if __name__ == '__main__':
-    print "correcting timestamps"
-    with rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/startup_sync_40fps_2017-11-07-12-46-09.bag') as inbag:
+    rospy.init_node('correct_bag', anonymous=True)
+    infile = rospy.get_param('~infile')
+
+    print "correcting timestamps of", infile
+    with rosbag.Bag(infile) as inbag:
         with rosbag.Bag('output.bag', 'w') as outbag:
 
             for topic, msg, t in inbag.read_messages():
 
-                if topic == "/synchronized/camera/image_raw" \
-                or topic == "/synchronized/camera/capture_info" \
-                or topic == "/camera/image_raw" \
-                or topic == "/camera/capture_info":
+                if hasattr(msg, 'header'):
                     outbag.write(topic, msg, msg.header.stamp)
                 else:
                     outbag.write(topic, msg, t)

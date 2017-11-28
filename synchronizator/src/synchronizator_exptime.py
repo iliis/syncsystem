@@ -52,7 +52,7 @@ class ExpTimeTest:
 
     TIMEOUT = rospy.Duration.from_sec(2) # timeout for waiting for data/synchronized frames etc.
 
-    OFFSET_HISTORY_SIZE = 10 # keep offset of last N frames to detect dropped frames and such
+    OFFSET_HISTORY_SIZE = 30 # keep offset of last N frames to detect dropped frames and such
 
     #---------------------------------------------------------------------------
 
@@ -65,7 +65,7 @@ class ExpTimeTest:
 
         self.configclient = dynamic_reconfigure.client.Client('/camera')
 
-        rospy.Subscriber("/dvs/special_events", SpecialEvent, self.special_event_callback)
+        rospy.Subscriber("/dvs/special_events", SpecialEvent, self.special_event_callback, queue_size=20)
 
         self.capture_info_sub = message_filters.Subscriber("/camera/capture_info", CaptureInfo)
         self.camera_image_sub = message_filters.Subscriber("/camera/image_raw", Image)
@@ -104,106 +104,59 @@ class ExpTimeTest:
 
     def special_event_callback(self, event):
         with self.mutex:
+
+            if self.last_event is not None:
+
+                if event.polarity == self.last_event.polarity:
+                    rospy.logerr("got two consecutive special events with {} edge, this should not happen".format(\
+                            "rising" if event.polarity else "falling"))
+                    #self.reset_sync()
+                    #return
+
             if event.polarity == False:
+
+                if self.last_event is not None and self.last_event.polarity == False and self.time_offset_hist_idx >= 0:
+                    # we've missed a rising event!
+                    duration = np.median([h[2] for h in self.time_offset_hist]) # guess duration
+                    stamp    = self.last_falling.ts + duration/2 # middle of frame
+                    self.special_events.append( (stamp, duration, int(math.floor((self.last_falling.header.seq+1)/2))) ) # sequence number might be bullshit
+                    self.got_new_data.set()
+                    rospy.logwarn("inserting a guess for the missed rising event")
+
+
                 self.last_falling = event
-            elif self.last_falling is not None:
 
-                duration = event.ts - self.last_falling.ts
-                stamp    = self.last_falling.ts + duration/2 # middle of frame
+            else:
 
-                self.special_events.append( (stamp, duration) )
+                if self.last_event is not None and self.last_event.polarity == True and self.time_offset_hist_idx >= 0:
+                    # we've missed a falling event, use current framerate instead to guess where it was
+                    duration = np.median([h[2] for h in self.time_offset_hist])
+                    rospy.logwarn("inserting a guess for the missed falling event")
+                elif self.last_falling is not None:
+                    duration = event.ts - self.last_falling.ts
+                else:
+                    rospy.logwarn("ignoring rising edge event: no falling edge")
+                    return
+
+                stamp    = event.ts - duration/2 # middle of frame
+
+                self.last_falling = None
+                self.special_events.append( (stamp, duration, int(math.floor(event.header.seq/2))) )
                 self.got_new_data.set()
 
-            """
-                return
-
-            #print "got sync frame (exp_time:", (event.ts - self.last_falling).to_sec()*1000*1000, ", ts:", event.ts.to_sec(), ")"
-            if self.first_good_syncframe is None and self.match_exp_time((event.ts - self.last_falling).nsecs/1000):
-                #print("MATCH!")
-
-                # todo: which point in time to take? middle of exposure?
-                #self.first_good_syncframe = self.last_falling
-                self.first_good_syncframe = event.ts
-                self.first_good_sync_seq  = event.header.seq
-                self.check_first_good()
-
-            if self.image_event_seq_offset is not None:
-                # middle of exposure
-                correct_ts = self.last_falling + (event.ts-self.last_falling)/2
-                self.sync_timestamps[int(math.floor(event.header.seq/2))] = correct_ts
-
-                self.check_pending_buffers()
-            """
+            self.last_event = event
 
     #---------------------------------------------------------------------------
 
     def image_callback(self, info, img):
         with self.mutex:
+            if self.skip_initial_image_count > 0:
+                rospy.loginfo("skipping a frame")
+                self.skip_initial_image_count -= 1
+                return
+
             self.image_queue.append( (info, img) )
             self.got_new_data.set()
-
-            """
-            #print "got camera frame (exp_time:", img.exp_time_us, ", ts:", img.header.stamp.to_sec(), ")"
-            if self.first_good_cameraframe is None and self.match_exp_time(info.exp_time_us):
-                #print("MATCH!")
-                self.first_good_cameraframe = info.header.stamp
-                self.first_good_image_seq   = img.header.seq
-                self.check_first_good()
-
-            if self.image_event_seq_offset is not None:
-                self.image_queue.append((info, img))
-                self.check_pending_buffers()
-
-            if self.currently_set_exp_time is None:
-                self.start_synchronization(None)
-            """
-
-    #---------------------------------------------------------------------------
-
-
-    """
-    def check_first_good(self):
-        if self.first_good_syncframe and self.first_good_cameraframe:
-            # now keep track of this match-up...
-            self.image_event_seq_offset = int(math.floor(self.first_good_sync_seq/2)) - self.first_good_image_seq
-
-            print "found matching pair: time difference:", (self.first_good_cameraframe - self.first_good_syncframe).to_sec()*1000, "ms"
-            print "seq offset:", self.image_event_seq_offset
-
-
-    def check_pending_buffers(self):
-        if len(self.image_queue) == 0 or len(self.sync_timestamps) == 0:
-            return
-
-        i = 0
-        while i < len(self.image_queue):
-            info, img = self.image_queue[i]
-            expected_seq = img.header.seq + self.image_event_seq_offset
-
-            if expected_seq in self.sync_timestamps:
-
-                print "published synced image pair. offset:", (info.header.stamp-self.sync_timestamps[expected_seq]).to_sec()*1000, "ms"
-
-                info.header.stamp = self.sync_timestamps[expected_seq]
-                img .header.stamp = self.sync_timestamps[expected_seq]
-
-                self.image_pub.publish(img)
-                self.capt_info_pub.publish(info)
-
-                del self.image_queue[i]
-                del self.sync_timestamps[expected_seq]
-            else:
-                i += 1
-
-        if len(self.image_queue) > 2 and len(self.sync_timestamps) > 2:
-            print "WARNING: Matchup between images and sync events failed!"
-            for info, img in self.image_queue:
-                print "> IMAGE:", img.header.seq, img.header.seq+self.image_event_seq_offset
-
-            for seq, ts in self.sync_timestamps.iteritems():
-                print "> SYNC:", seq
-    """
-
 
     ############################################################################
     # MAIN THREAD
@@ -222,13 +175,15 @@ class ExpTimeTest:
         self.currently_set_exp_time = None
 
         self.last_falling = None
+        self.last_event   = None
 
-        self.special_events = [] # type: List[Tuple[rospy.Time, rospy.Duration]]
+        self.special_events = [] # type: List[Tuple[rospy.Time, rospy.Duration, int]]
         self.image_queue = []    # type: List[Tuple[CaptureInfo, Image]]
         # last N offsets to detect lost frames
-        self.time_offset_hist = [(None,None)] * self.OFFSET_HISTORY_SIZE # type: List[(stamp, duration)]
+        self.time_offset_hist = [(None,None,None)] * self.OFFSET_HISTORY_SIZE # type: List[(stamp, offset, duration)]
         self.time_offset_hist_idx = -self.OFFSET_HISTORY_SIZE
 
+        self.seq_idx_offset = None
 
         self.sync_state = 'wait_data'
         rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
@@ -287,7 +242,7 @@ class ExpTimeTest:
 
 
         duration_mean = np.median([ci.exp_time_us for ci,_ in self.image_queue])
-        measured_mean = np.median([d.nsecs/1000.0 for _, d in self.special_events])
+        measured_mean = np.median([d.nsecs/1000.0 for _, d, _ in self.special_events])
 
         #rospy.loginfo("current exposure time: {} us, measured: {} us".format(duration_mean, measured_mean))
 
@@ -323,7 +278,7 @@ class ExpTimeTest:
 
         # look for change in exposure time of camera images
 
-        skip_imgs = 1 # skip a frame, as camera_info reports exposure time change too early
+        skip_imgs = 0 #1 # skip a frame, as camera_info reports exposure time change too early
         match_img_idx = None
         for idx, (info, img) in enumerate(self.image_queue):
             if self.match_exp_time(info.exp_time_us):
@@ -346,7 +301,7 @@ class ExpTimeTest:
         # look for change in exposure time in special events
 
         match_event_idx = None
-        for idx, (stamp, duration) in enumerate(self.special_events):
+        for idx, (stamp, duration, seq) in enumerate(self.special_events):
             if self.match_exp_time(duration.nsecs/1000.0):
                 match_event_idx = idx
                 break
@@ -360,22 +315,47 @@ class ExpTimeTest:
         if not match_event_idx:
             return False # wait for more special events
 
-        rospy.loginfo("got match at {} ms offset".format( \
-                (self.image_queue[match_img_idx][0].header.stamp - self.special_events[match_event_idx][0]).to_sec()*1000 ))
+        self.seq_idx_offset = self.image_queue[match_img_idx][0].header.seq - self.special_events[match_event_idx][2]
+
+        rospy.loginfo("got match at {} ms offset (seq diff: {})".format( \
+                (self.image_queue[match_img_idx][0].header.stamp - self.special_events[match_event_idx][0]).to_sec()*1000, \
+                self.seq_idx_offset ))
+
 
         # delete data from before match
         del self.image_queue[0:match_img_idx]
         del self.special_events[0:match_event_idx]
 
+        # we've got a good match!
         return True
+
+    #---------------------------------------------------------------------------
+
+    # drops either an image frame (count < 0) or a special event pair (count > 0)
+    def drop_frame(self, count):
+        if count > 0:
+            if len(self.special_events) > 0:
+                del self.special_events[0]
+                rospy.logwarn("deleting an event")
+        elif count < 0:
+            if len(self.image_queue) > 0:
+                # TODO: don't delete image, insert fake event instead, using guess based on past N frames
+                del self.image_queue[0]
+                rospy.logwarn("deleting an image")
+            else:
+                self.skip_initial_image_count = 1
+
+        # drop history so far
+        self.time_offset_hist_idx = -self.OFFSET_HISTORY_SIZE
+
 
     #---------------------------------------------------------------------------
 
     def publish(self):
         while len(self.image_queue) > 0 and len(self.special_events) > 0:
 
-            (info, img)       = self.image_queue.pop(0)
-            (stamp, duration) = self.special_events.pop(0)
+            (info, img)            = self.image_queue.pop(0)
+            (stamp, duration, seq) = self.special_events.pop(0)
             offset = info.header.stamp - stamp
 
             # check if match is still good
@@ -388,20 +368,37 @@ class ExpTimeTest:
             # do we have a good amount of past data?
             # otherwise just go on and hope for the best
             if self.time_offset_hist_idx >= 0:
-                offset_mean   = np.median([o for _, o in self.time_offset_hist])
-                offset_stddev = np.std(   [o for _, o in self.time_offset_hist])
+                offset_mean   = np.median([h[1] for h in self.time_offset_hist])
+                offset_stddev = np.std(   [h[1] for h in self.time_offset_hist])
 
-                fps_mean = np.median([(b-a).to_sec() for (a,_),(b,_) in prevnext(self.time_offset_hist)])
+                seq_offset_err = (info.header.seq - seq) - self.seq_idx_offset
 
-                #rospy.loginfo("Offset: mean: {} ms, stddev: {} ms, FPS: mean: {}".format(offset_mean*1000, offset_stddev*1000, 1/fps_mean))
+                fps_mean = np.median([(b[0]-a[0]).to_sec() for a, b in prevnext(self.time_offset_hist)])
 
-                if abs(offset.to_sec()-offset_mean) > offset_stddev*10+10: # add a const. term as stddev can get quite small
+                if 1:
+                    rospy.loginfo("{:5d} {:5d} {} Offset: current: {:5.1f}, mean: {:5.1f} ms, stddev: {:5.2f} ms, FPS: mean: {:4.1f}, err: {:7.2f}" \
+                        .format(\
+                        seq, info.header.seq, seq_offset_err,
+                        offset.to_sec()*1000, offset_mean*1000, offset_stddev*1000, 1/fps_mean, \
+                        (abs(offset.to_sec()-offset_mean)-offset_stddev*4)*1000 ))
+
+
+                # TODO: incoroporate expected offset of a single frame!
+                if abs(offset_mean) > fps_mean/2:
+                    rospy.logwarn("we seem to be off by more than half a frame, resyncing")
+                    self.drop_frame(1 if offset_mean > 0 else -1)
+
+                """
+                if abs(offset.to_sec()-offset_mean) > offset_stddev*4 + 0.01: # add a const. term as stddev can get quite small
                     rospy.logwarn("Unexpected offset measured, last {} were {} ms (+/- {}), but this is {} ms" \
                             .format(self.OFFSET_HISTORY_SIZE, offset_mean*1000, offset_stddev*1000, offset.to_sec()*1000))
 
+                    # missing frame recovery doesn't really work, just resync if we're off
+                    # offset is very dependent on CPU usage and can easily be off be a frame or two for a moment
+
                     # assume we've lost some frames
                     offset_frames, offset_fraction = floor_rest( (offset.to_sec() - offset_mean) / fps_mean )
-                    if offset_fraction < 0.1: # TODO: this is just a guess
+                    if 0.5-abs(offset_fraction-0.5) < 0.2: # TODO: this is just a guess
                         rospy.logwarn("Detected loss of {} frames.".format(abs(offset_frames)))
                         if abs(offset_frames) >= self.OFFSET_HISTORY_SIZE/2:
                             rospy.logerr("This seems a bit high, aborting.")
@@ -427,8 +424,33 @@ class ExpTimeTest:
                         continue # try again
                     else:
                         if abs(offset_frames) > 0:
-                            rospy.logerr("offset is off by a non-integer fraction of a frame. Can't recover, try to sync again.")
+                            rospy.logerr("offset is off by a non-integer fraction of a frame ({}). Can't recover, try to sync again."\
+                                    .format(offset_frames+offset_fraction))
                             return False
+                    """
+
+                """
+                if seq_offset_err != 0:
+                    rospy.logerr("sequence numbers got out of sync, something must have gone wrong. actual: {} expected: {}".format( \
+                            info.header.seq - seq, self.seq_idx_offset))
+
+                    # assume we've lost some frames
+                    if seq_offset_err > 0:
+                        rospy.logerr("Lost images.")
+                        if len(self.special_events) > 0:
+                            del self.special_events[0]
+                            rospy.loginfo("deleting an event")
+                    else:
+                        seq_offset_err = abs(seq_offset_err)
+                        rospy.logerr("Lost special events.")
+                        if len(self.image_queue) > 0:
+                            del self.image_queue[0]
+                            rospy.loginfo("deleting an image")
+                        else:
+                            self.skip_initial_image_count = 1
+
+                    continue
+                    """
 
             # keep track of last N frames
 
@@ -436,7 +458,7 @@ class ExpTimeTest:
             if self.time_offset_hist_idx >= self.OFFSET_HISTORY_SIZE:
                 self.time_offset_hist_idx = 0
 
-            self.time_offset_hist[self.time_offset_hist_idx] = ( stamp, offset.to_sec() )
+            self.time_offset_hist[self.time_offset_hist_idx] = ( stamp, offset.to_sec(), duration )
 
             # actually publish synchronized image
 
@@ -466,14 +488,6 @@ class ExpTimeTest:
                 if self.sync_state == 'wait_data':
                     # we're waiting for data from both cameras
                     if len(self.image_queue) > 0 and len(self.special_events) > 0:
-
-                        if self.skip_initial_image_count > 0:
-                            rospy.loginfo("skipping {} frame[s]".format(len(self.image_queue)))
-                            self.skip_initial_image_count -= len(self.image_queue)
-                            self.image_queue = []
-                            self.special_events = []
-                            continue
-
 
                         self.update_original_exp_time()
                         if not self.verify_exp_time_measurements():
