@@ -41,7 +41,7 @@ def floor_rest(f):
 
 ################################################################################
 
-class ExpTimeTest:
+class ExpTimeSynchronizator:
 
     # PARAMETERS
     #############################################
@@ -256,7 +256,7 @@ class ExpTimeTest:
         if ref_us is None:
             ref_us = self.currently_set_exp_time
 
-        return ref_us - ExpTimeTest.TOLERANCE_US <= time_us <= ref_us + ExpTimeTest.TOLERANCE_US
+        return ref_us - ExpTimeSynchronizator.TOLERANCE_US <= time_us <= ref_us + ExpTimeSynchronizator.TOLERANCE_US
 
     #---------------------------------------------------------------------------
 
@@ -387,9 +387,13 @@ class ExpTimeTest:
             # check if match is still good
 
             if not self.match_exp_time(info.exp_time_us, duration.nsecs/1000):
-                # TODO: take offset by single frame into account!
                 rospy.logwarn("publishing image with significantly different exposure time than measured: " \
                         + "{} ms reported by capture_info, {} ms measured by DAVIS.".format(info.exp_time_us/1000.0, duration.to_sec()*1000))
+
+                # use theoretical exposure time (which is wrong when exposure
+                # time is set higher than the driver allows, but correct when
+                # events are missing/wrong)
+                duration = info.exp_time_us
 
             # do we have a good amount of past data?
             # otherwise just go on and hope for the best
@@ -555,7 +559,7 @@ class ExpTimeTest:
 ################################################################################
 
 if __name__ == "__main__":
-    e = ExpTimeTest()
+    e = ExpTimeSynchronizator()
     e.main()
 
 ################################################################################
