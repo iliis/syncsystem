@@ -28,13 +28,15 @@ class SpecialEventsPLL:
 
         rospy.init_node('event_visualizer', anonymous=True)
 
-        rospy.Subscriber("/dvs/special_events", SpecialEvent, self.special_event_callback, queue_size=20)
+        rospy.Subscriber("/dvs/special_events", SpecialEvent, self.special_event_callback, queue_size=None)
 
-        self.event_publisher = rospy.Publisher("/synchronized/special_events", SpecialEvent, queue_size=20)
+        self.event_publisher = rospy.Publisher("/synchronized/special_events", SpecialEvent, queue_size=0)
+
+        self.invert_special_events = rospy.get_param('~invert_special_events', False)
 
         self.timeout_timer = None
 
-        self.last_falling_edge = None
+        self.last_rising_edge = None
         self.last_measured_frame_t = None
 
         self.last_published_frame_t = None
@@ -48,34 +50,37 @@ class SpecialEventsPLL:
 
         # if PLL has locked output actual events if there are any that are
         # close enough to the ones predicted by the PLL
-        self.measured_frames = []
+        self.measured_frames = [] # type: List[Tuple[rospy.Time, rospy.Duration]]
 
     #---------------------------------------------------------------------------
 
     def special_event_callback(self, event):
         with self.mutex:
 
-            if event.polarity == False: # begin of a frame
-                if self.last_falling_edge is not None:
-                    # error, two falling edges after each other
-                    rospy.logwarn("invalid falling edge")
+            if self.invert_special_events:
+                event.polarity = not event.polarity
+
+            if event.polarity == True: # begin of a frame
+                if self.last_rising_edge is not None:
+                    # error, two rising edges after each other
+                    rospy.logwarn("invalid rising edge")
                     pass # can't do anything here
 
-                self.last_falling_edge = event
+                self.last_rising_edge = event
 
             else:
 
                 self.has_settled = False
 
-                if self.last_falling_edge is None:
-                    # error, this can't happen in proper operation (but does, the DAVIS improperly handles very short spikes (~100us))
-                    rospy.logwarn("ignoring invalid rising edge")
+                if self.last_rising_edge is None:
+                    # error, this can't happen in proper operation (but sometimes does, eg. if ROS is dropping messages)
+                    rospy.logwarn("ignoring invalid falling edge")
                     return # ignore this event
 
-                current_exp_time = event.ts - self.last_falling_edge.ts
+                current_exp_time = event.ts - self.last_rising_edge.ts
                 current_frame_t  = event.ts - current_exp_time/2
 
-                self.last_falling_edge = None
+                self.last_rising_edge = None
 
                 if current_exp_time < rospy.Duration.from_sec(0.0005):
                     rospy.logwarn("ignoring very short frame with {} us exposure time.".format(current_exp_time.nsecs/1000))
@@ -112,7 +117,7 @@ class SpecialEventsPLL:
                 self.est_frame_period  += frame_period_err * self.GAIN
                 self.last_published_frame_t += phase_err * self.GAIN
 
-                errstr = "Estimation errors: exposure time: {:4.3f} ms, frame period: {:4.3f} ms, phase: {} ms" \
+                errstr = "Estimation errors: exposure time: {:6.3f} ms, frame period: {:6.3f} ms, phase: {:6.3f} ms" \
                         .format(exp_time_err.to_sec()*1000, frame_period_err.to_sec()*1000, phase_err.to_sec()*1000)
 
                 if abs(phase_err) < rospy.Duration.from_sec(0.0001):
@@ -121,6 +126,7 @@ class SpecialEventsPLL:
 
                     self.measured_frames.append( (current_frame_t, current_exp_time) )
                 else:
+                    self.has_settled = False
                     rospy.logwarn(errstr)
 
 
@@ -131,7 +137,7 @@ class SpecialEventsPLL:
 
     def main(self):
         while not rospy.is_shutdown():
-            self.got_new_data.wait(timeout=self.TIMEOUT.to_sec())
+            self.got_new_data.wait(timeout=self.TIMEOUT.to_sec()) # todo: lower this, to quickly react to lost events
             if not self.got_new_data.is_set():
                 rospy.logwarn("Timeout in main thread while waiting for data.")
                 continue
@@ -139,7 +145,7 @@ class SpecialEventsPLL:
             with self.mutex:
                 self.process()
 
-    # just to keep intendation to a minimum ;)
+    # just to keep indentation to a minimum ;)
     def process(self):
 
         # wait for PLL to settle
@@ -149,9 +155,6 @@ class SpecialEventsPLL:
         # don't publish events into the future
         if self.last_published_frame_t + self.est_frame_period > rospy.Time.now():
             return
-
-        # advance to next frame
-        self.last_published_frame_t += self.est_frame_period
 
         # but don't publish anything while PLL hasn't locked in yet
         if not self.has_settled:
@@ -163,6 +166,7 @@ class SpecialEventsPLL:
         current_exp_time = self.est_exposure_time
 
         for i in reversed(range(len(self.measured_frames))):
+
             frame_t  = self.measured_frames[i][0]
             exp_time = self.measured_frames[i][1]
             if abs(frame_t - current_frame_t) < rospy.Duration.from_sec(0.001):
@@ -170,11 +174,18 @@ class SpecialEventsPLL:
                 current_frame_t  = frame_t
                 current_exp_time = exp_time
                 del self.measured_frames[:i+1] # remove everything up to and including this frame
+                # advance to next frame
+                self.last_published_frame_t += self.est_frame_period
                 break
+            else:
+                rospy.logwarn("measured data off by too much, publishing estimated data. Error: {:6.3f}ms".format((frame_t-current_frame_t).to_sec()*1000))
+                # delete every frame in the past
+                # TODO: ???
+                del self.measured_frames[:]
 
 
         synced_event_begin = SpecialEvent()
-        synced_event_begin.polarity = False
+        synced_event_begin.polarity = not self.invert_special_events
         synced_event_begin.ts = current_frame_t - current_exp_time/2
         synced_event_begin.header.seq = self.published_event_seq
         synced_event_begin.header.stamp = synced_event_begin.ts
@@ -182,7 +193,7 @@ class SpecialEventsPLL:
         self.published_event_seq += 1
 
         synced_event_end = SpecialEvent()
-        synced_event_end.polarity = True
+        synced_event_end.polarity = self.invert_special_events
         synced_event_end.ts = current_frame_t + current_exp_time/2
         synced_event_end.header.seq = self.published_event_seq
         synced_event_end.header.stamp = synced_event_end.ts
@@ -191,6 +202,10 @@ class SpecialEventsPLL:
 
         self.event_publisher.publish(synced_event_begin)
         self.event_publisher.publish(synced_event_end)
+
+        # advance to next frame
+        self.last_published_frame_t += self.est_frame_period
+
 
         #rospy.loginfo("published frame: duration = {}, fps = {}".format(self.est_exposure_time, 1/self.est_frame_period.to_sec()))
 

@@ -16,6 +16,10 @@ if __name__ == '__main__':
 
             for topic, msg, t in inbag.read_messages():
 
+                # ignore normal events, they take a long time to fix
+                if topic == '/dvs/events':
+                    continue
+
                 if hasattr(msg, 'header'):
                     outbag.write(topic, msg, msg.header.stamp)
                 else:
