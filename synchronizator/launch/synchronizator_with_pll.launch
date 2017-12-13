@@ -1,0 +1,8 @@
+<launch>
+  <!-- Synchronization (of raw images) -->
+  <node name="synchronizator_filter" pkg="synchronizator" type="pll2.py" output="screen" />
+  <node name="synchronizator" pkg="synchronizator" type="synchronizator_exptime.py" output="screen">
+    <param name="skip_first_frames" value="2" />
+    <remap from="/dvs/special_events" to="/synchronized/special_events" />
+  </node>
+</launch>
