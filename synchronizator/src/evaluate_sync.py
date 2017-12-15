@@ -3,8 +3,11 @@
 import itertools
 import datetime
 import math
+import os
 import pickle
 import hashlib
+import csv
+from collections import OrderedDict
 
 import rospy
 import rosbag
@@ -19,11 +22,14 @@ from scipy.interpolate import interp1d
 
 
 
-VERT_POS = 280
-VERT_POS_DVS = 90
+VERT_POS = 255
+VERT_POS_DVS = 160
 
 MIN_HORIZ_CAM = 260
 MAX_HORIZ_CAM = 520
+
+MIN_HORIZ_DVS = 36
+MAX_HORIZ_DVS = 320
 
 DVS_WIDTH = 350 # 240 for DAVIS
 
@@ -31,7 +37,41 @@ DVS_WIDTH = 350 # 240 for DAVIS
 EVENT_HIST_WINDOW_SIZE = rospy.Duration.from_sec(0.01)
 EVENT_HIST_WINDOW_INC  = rospy.Duration.from_sec(0.002)
 
+PLOT_EXPORT_DIR = '/home/samuel/sync/ETH/Master/Semester 3/syncsystem/plots/long_recording/multiplication/'
 
+################################################################################
+# Helper Functions
+
+def prevnext(l):
+    it = iter(l)
+    try:
+        last_obj = it.next()
+        while True:
+            next_obj = it.next()
+            yield last_obj, next_obj
+            last_obj = next_obj
+    except StopIteration:
+        pass
+
+def prevcurnext(l):
+    it = iter(l)
+    try:
+        last_obj = it.next()
+        cur_obj  = it.next()
+        while True:
+            next_obj = it.next()
+            yield last_obj, cur_obj, next_obj
+            last_obj = cur_obj
+            cur_obj = next_obj
+    except StopIteration:
+        pass
+
+
+# guess f(x) by interpolating between y1=f(x1) and y2=f(x2)
+def interpolate(x1, y1, x2, y2, x):
+    assert x1 <= x <= x2
+
+    return (x-x1)/(x2-x1) * (y2-y1) + y1
 
 
 # from http://scipy-cookbook.readthedocs.io/items/SignalSmooth.html
@@ -107,58 +147,103 @@ def print_progress(label, current_t, start_t, end_t):
 
 
 
+def load_from_csv(bag, name):
+    filename = '{}_{}.csv'.format(bag.filename, name)
+
+    try:
+        data = []
+        with open(filename, 'rb') as f:
+            print "loading", name, "from", filename
+            datareader = csv.reader(f, delimiter=',')
+            for row in datareader:
+                if len(data) == 0:
+                    for _ in range(len(row)):
+                        data.append([])
+
+                for c, col in enumerate(row):
+                    data[c].append(float(col))
+
+            return data
+    except IOError:
+        print "no cached CSV data found for", name, "reading from bag"
+        return None
+
+def save_to_csv(bag, name, data):
+    filename = '{}_{}.csv'.format(bag.filename, name)
+
+    i = 0
+    with open(filename, 'wb') as f:
+        datawriter = csv.writer(f, delimiter=',')
+        for row in data:
+            i+=1
+            datawriter.writerow(list(row))
+
+    assert i > 5 # otherwise something probably went wrong ;)
+    print "wrote", i, "lines to", filename
+
+
+def cache_in_csv(func):
+    def wrapper(bag, topic, *args, **kwargs):
+        # try to load cached data from disk
+        data = load_from_csv(bag, topic.replace('/', '_'))
+        if data is not None:
+            return data
+
+        # welp, we didn't get it. Let's compute it manually!
+        data = func(bag, topic, *args, **kwargs)
+
+        # and store it, so we can retrieve it next time
+        save_to_csv(bag, topic.replace('/', '_'), zip(*data))
+
+        return data
+    return wrapper
+
+
+
+def find_transition(data, thresh):
+    for pos, (prev, cur) in enumerate(prevnext(data)):
+        if prev < thresh and cur >= thresh:
+            return interpolate(prev, pos, cur, pos+1, thresh)
+    return None
+
+# TODO: use dynamic programming to optimize this
+def find_edge_by_clustering(data):
+    data = np.array(data, dtype='float')
+    best_cost = float('inf')
+    best_pos  = None
+    for pos in range(len(data)):
+        cost = sum(abs(data[:pos]-np.average(data[:pos]))) + sum(abs(data[pos:]-np.average(data[pos:])))
+        if cost < best_cost:
+            best_cost = cost
+            best_pos = pos
+
+    return find_transition(data, (np.average(data[best_pos:])*2+np.average(data[:best_pos]))/3), best_pos
+
+
 
 
 def find_edge(data):
 
     #diff = abs(data[1:] - data[:-1])
+
     # actually, there is no need for abs(), as long as the darker side is to the left ;)
     diff = np.ediff1d(np.array(data, dtype='float'))
 
     pos = np.argmax(diff)
 
+    if pos < 3 or pos > len(diff)-4:
+        return None
+
     # improve accuracy by using weighted average over neighbouring pixels
     neighborhood = diff[pos-3:pos+4]
 
-    return float(np.linspace(pos-3, pos+3, 7).dot(neighborhood / sum(neighborhood)))
+    s = float(sum(neighborhood))
+    if s == 0:
+        return None
+
+    return np.linspace(pos-3, pos+3, 7).dot(neighborhood / s)
 
 
-# guess f(x) by interpolating between y1=f(x1) and y2=f(x2)
-def interpolate(x1, y1, x2, y2, x):
-    assert x1 <= x <= x2
-
-    return (x-x1)/(x2-x1) * (y2-y1) + y1
-
-
-def correlate(camera_pos, dvs_pos, t_offset):
-
-    camera_pos_iter = iter(camera_pos)
-    dvs_pos_iter    = iter(dvs_pos)
-
-    accum = 0
-    try:
-        dvs_next_t, dvs_next_pos = next(dvs_pos_iter)
-
-        while True: # iterate over all camera framesj
-            cam_t, cam_pos = next(camera_pos_iter)
-
-            # find events before and after current frame
-            while True:
-                dvs_prev_t, dvs_prev_pos = dvs_next_t, dvs_next_pos
-                dvs_next_t, dvs_next_pos = next(dvs_pos_iter)
-                if cam_t+t_offset < dvs_next_t:
-                    break
-
-            if cam_t+t_offset < dvs_prev_t:
-                continue # ignore frames that aren't between two dvs position estimates
-
-            if dvs_next_t - dvs_prev_t >= 0.05:
-                continue # ignore frames that don't have a close position estimate from dvs
-
-            accum += abs(interpolate(dvs_prev_t, dvs_prev_pos, dvs_next_t, dvs_next_pos, cam_t+t_offset) - cam_pos)
-
-    except StopIteration:
-        return accum
 
 
 class Event(object):
@@ -222,8 +307,9 @@ def track_line_by_events(initial_pos_estimate, events, window_size=20, max_dist=
                 # not enough events, collect some more
                 continue
 
+            pos_t.append(np.average([e.ts.to_sec()-bag.get_start_time() for e in local_buffer]))
+
             last_pos = np.average([e.x for e in local_buffer])
-            pos_t.append(np.average([e.ts.to_sec() for e in local_buffer]))
             pos_x.append(last_pos)
 
             del local_buffer[0] # throw out old events
@@ -238,98 +324,120 @@ def normalize(arr):
     arr /= np.max(arr)
     return arr
 
+def normalize_avg(arr):
+    arr -= np.average(arr)
+    arr /= np.std(arr)
+    return arr
 
-if __name__ == '__main__':
-    #bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/vert_line_2017-11-20-15-15-39.bag')
-    #bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/synced_vert_line_2017-11-22-15-54-48.bag')
-    #bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/linear_slider/simple_test_2017-12-05-17-52-02.bag')
-    #bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/linear_slider/simple_test2_2017-12-05-18-15-09.bag')
-
-    bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/linear_slider/nosync_2017-12-09-16-20-31.bag')
-
-    bridge = CvBridge()
-
-    #fig, ax = plt.subplots()
-
-
+@cache_in_csv
+def read_acceleration(bag, topic = '/dvs/imu'):
     accel_t = []
     accel_x = []
     accel_y = []
     accel_z = []
-    for topic, msg, ts in bag.read_messages(topics=['/dvs/imu']):
+    for topic, msg, ts in bag.read_messages(topics=[topic]):
         print_progress("reading IMU data", ts.to_sec(), bag.get_start_time(), bag.get_end_time())
         accel_t.append(msg.header.stamp.to_sec() - bag.get_start_time())
-        accel_x.append(msg.linear_acceleration.x)
-        accel_y.append(msg.linear_acceleration.y)
-        accel_z.append(msg.linear_acceleration.z)
+        #accel_x.append(msg.linear_acceleration.x)
 
-    #plt.plot(t, y)
-    #plt.plot(t, 
+        # IMU appearantly looks in the other direction ;)
+        accel_y.append(-msg.linear_acceleration.y)
+
+        #accel_z.append(msg.linear_acceleration.z)
+
     accel_y = smooth(np.array(accel_y), window_len=51)
 
+    return accel_t, accel_y
 
-
+@cache_in_csv
+def read_image_positions(bag, topic, vert_pos, horiz_range):
 
     positions_x = []
     positions_t = []
     last_pos = None
 
-    for topic, msg, t in bag.read_messages(topics=['/camera/image_raw']):
-        cv_image = bridge.imgmsg_to_cv2(msg) #, desired_encoding="passthrough")
+    for topic, msg, t in bag.read_messages(topics=[topic]):
+        cv_image = np.array(bridge.imgmsg_to_cv2(msg), dtype=float) #, desired_encoding="passthrough")
 
+        if cv_image.ndim == 3:
+            assert cv_image.shape[2] == 3
+            cv_image = np.sum(cv_image, axis=2) # sum over colors
 
-        #plt.plot( cv_image[VERT_POS, :, 0] )
-        #plt.plot( smooth(cv_image[VERT_POS, :, 0], 20) )
+        # cut out the interesting patch of the camera image
+        # sum it vertically to reduce noise
+        line = np.sum( cv_image[vert_pos-10:vert_pos+10, horiz_range[0]:horiz_range[1]], axis=0 )
 
-        #pos = find_edge( smooth(cv_image[VERT_POS, MIN_HORIZ_CAM:MAX_HORIZ_CAM, 0]) )
-        pos = find_edge( cv_image[VERT_POS, MIN_HORIZ_CAM:MAX_HORIZ_CAM, 0] )
+        #pos  = find_edge(line)
+        pos, cl_pos = find_edge_by_clustering(line)
 
-        if last_pos is not None and pos is not None and abs(last_pos - pos) > 60:
-            continue # ignore sudden jumps
+        if False and t.to_sec() - bag.get_start_time() > 47:
+            diff = np.ediff1d(line)
+            fig = plt.figure()
+            p = fig.add_subplot(121)
+            p.plot(diff)
+            p.plot(line)
+            p.plot(smooth(line, window_len=21))
+            p.plot(np.ediff1d(smooth(line, window_len=21)))
+            if pos is not None:
+                p.axvline(pos, color='red')
+                a1 = np.average(line[cl_pos:])
+                a2 = np.average(line[:cl_pos])
+                p.axhline(a1)
+                p.axhline(a2)
 
+            pos2 = find_edge(line)
+            if pos2 is not None:
+                p.axvline(pos2, color='blue')
+            p.axhline((a1*2+a2)/3)
+            p.legend(['diff', 'data', 'smoothed data', 'smoothed diff'])
+
+            p2 = fig.add_subplot(122)
+            p2.imshow(cv_image, interpolation='nearest')
+            p2.set_title('DVS image')
+            p2.axvline(horiz_range[0], color='red')
+            p2.axvline(horiz_range[1], color='red')
+            p2.axhline(vert_pos-10, color='red')
+            p2.axhline(vert_pos+10, color='red')
+
+            plt.show()
+
+        # ignore sudden jumps
+        if pos is None or (last_pos is not None and pos is not None and abs(last_pos - pos) > 60):
+            continue
 
         positions_x.append(pos)
         positions_t.append(msg.header.stamp.to_sec() - bag.get_start_time())
         last_pos = pos
 
-        print_progress('processing images', t.to_sec(), bag.get_start_time(), bag.get_end_time())
+        print_progress('processing {}'.format(topic), t.to_sec(), bag.get_start_time(), bag.get_end_time())
+        #print "processing image at t =", t.to_sec() - bag.get_start_time()
 
-        #break
+    return np.array(positions_t), np.array(positions_x)
 
 
+def read_slider_positions(bag, topic='/linear_slider_ros_interface/pose'):
+    times = []
+    pos = []
+    for topic, msg, t in bag.read_messages(topics=[topic]):
+        #print_progress('reading slider positions', t.to_sec(), bag.get_start_time(), bag.get_end_time())
+        #print msg.pose.position.x
+        times.append(msg.header.stamp.to_sec()-bag.get_start_time())
+        pos.append(msg.pose.position.x)
 
-    #new_t = np.linspace(positions_t[0], positions_t[-1],10000)
-    #interp = interp1d(positions_t, positions_x, kind='quadratic')
+    return times, pos
 
-    p1 = plt.figure().add_subplot(111)
-
-    #p1.plot(new_t, interp(new_t), '-r')
-    #p1.plot(positions_t, smooth(np.array(positions_x)), '-g')
-    p1.plot(positions_t, positions_x, '.b')
-
-    #p1.legend(['smoothed', 'raw measurements'])
-
-    p1.set_title('camera movmement')
-    p1.set_xlabel('time [s]')
-    p1.set_ylabel('horizontal position [px]')
-
-    #plt.show()
-
+@cache_in_csv
+def read_dvs_position_by_integration(bag, topic): # topic is not used in here, but cache_in_csv requires it
+    events = read_events_cached(bag)
 
     positions_dvs_x = []
     positions_dvs_t = []
     positions_hist = np.zeros( (DVS_WIDTH, 1) )
 
-    window_start_t = None
-
     # get the timestamp of the very first event
-    for topic, msg, t in bag.read_messages(topics=['/dvs/events']):
-        window_start_t = msg.events[0].ts
-        break
+    window_start_t = events[0].ts
 
-    event_buffer = read_events_cached(bag)
-    all_events = list(event_buffer) # make copy
-
+    events = list(events) # make copy, as we're going to edit this list
 
     last_pos = None
     while window_start_t < rospy.Time.from_sec(bag.get_end_time()):
@@ -341,23 +449,23 @@ if __name__ == '__main__':
         window_end_t = window_start_t + EVENT_HIST_WINDOW_SIZE
 
         # find oldest event that is still in window
-        for idx, event in enumerate(event_buffer):
+        for idx, event in enumerate(events):
             if event.ts >= window_start_t:
                 break
 
-        if len(event_buffer) < 3:
+        if len(events) < 3:
             #positions_hist = np.concatenate((positions_hist, np.zeros((DVS_WIDTH,1))), axis=1)
             continue
 
         # delete old events
-        del event_buffer[:idx]
+        del events[:idx]
 
-        if len(event_buffer) < 3:
+        if len(events) < 3:
             #positions_hist = np.concatenate((positions_hist, np.zeros((DVS_WIDTH,1))), axis=1)
             continue
 
         # find newest oldest event after window (i.e. the first one not in the window anymore)
-        for idx, event in enumerate(event_buffer):
+        for idx, event in enumerate(events):
             if event.ts > window_end_t:
                 break
 
@@ -369,7 +477,7 @@ if __name__ == '__main__':
         # calculate histogram of current window
         dvs_pixels = np.zeros( (DVS_WIDTH, 1) ) # width of DAVIS sensor
 
-        for event in event_buffer[:idx]:
+        for event in events[:idx]:
             dvs_pixels[event.x] += 1
 
         # smooth histogram
@@ -410,101 +518,251 @@ if __name__ == '__main__':
 
         positions_hist = np.concatenate((positions_hist, dvs_pixels), axis=1)
 
+    return positions_dvs_t, positions_dvs_x
+
+def clean_event_positions(times, positions, max_deltaT=0.05):
+    i = 1
+    while i < len(positions):
+        if i < len(positions)-1:
+            if times[i]-times[i-1] >= max_deltaT and times[i+1]-times[i] >= max_deltaT:
+                del positions[i]
+                del times[i]
+                i -= 1
+        i+=1
 
 
-    # initialize using one of the first positions calculated using normal method
-    pos_dvs2_t, pos_dvs2_x = track_line_by_events(positions_dvs_x[2], all_events)
-    # use relative time
-    pos_dvs2_t = [t - bag.get_start_time() for t in pos_dvs2_t]
+def correlate(camera_pos, dvs_pos, t_offset):
+
+    camera_pos_iter = iter(camera_pos)
+    dvs_pos_iter    = iter(dvs_pos)
+
+    accum = 0
+    try:
+        dvs_next_t, dvs_next_pos = next(dvs_pos_iter)
+
+        while True: # iterate over all camera framesj
+            cam_t, cam_pos = next(camera_pos_iter)
+
+            # find events before and after current frame
+            while True:
+                dvs_prev_t, dvs_prev_pos = dvs_next_t, dvs_next_pos
+                dvs_next_t, dvs_next_pos = next(dvs_pos_iter)
+                if cam_t+t_offset < dvs_next_t and dvs_prev_pos is not None and dvs_next_pos is not None:
+                    break
+
+            if cam_t+t_offset < dvs_prev_t:
+                continue # ignore frames that aren't between two dvs position estimates
+
+            if dvs_next_t - dvs_prev_t >= 0.05:
+                continue # ignore frames that don't have a close position estimate from dvs
+
+            if dvs_prev_pos is None or dvs_next_pos is None or cam_pos is None:
+                continue
+
+            accum += abs(interpolate(dvs_prev_t, dvs_prev_pos, dvs_next_t, dvs_next_pos, cam_t+t_offset) - cam_pos)
+
+    except StopIteration:
+        return accum
 
 
-    p2 = plt.figure().add_subplot(111)
-    #plt.plot(positions_dvs)
-    p2.imshow(positions_hist, cmap='hot', interpolation='nearest')
-    p2.set_title('DVS raw movement')
-    p2.set_xlabel('time [nonlinear, {}s/px]'.format(EVENT_HIST_WINDOW_INC.to_sec()))
-    p2.set_ylabel('horizontal position [px]')
-    #plt.colorbar()
+def correlate2(query_t, query_x, ref_t, ref_x, t_offset):
 
-    p3 = plt.figure().add_subplot(111)
+    query_t = [t+t_offset for t in query_t]
 
-    interp = interp1d(positions_dvs_t, positions_dvs_x, kind='quadratic')
-    interp_t = np.linspace(positions_dvs_t[0], positions_dvs_t[-1], len(positions_dvs_t)*10)
-    p3.plot(interp_t, interp(interp_t), '-')
+    # cut query points so that we're not going outside reference values
+    query_t = query_t[10:-10]
+    query_x = query_x[10:-10]
 
-    pos_dvs2_x_smooth = smooth(np.array(pos_dvs2_x), window_len=41)
+    while query_t[0] <= ref_t[10]:
+        query_t = query_t[10:]
+        query_x = query_x[10:]
 
-    p3.plot(positions_dvs_t, positions_dvs_x, '.b')
-    p3.plot(pos_dvs2_t, pos_dvs2_x, '.r')
-    p3.plot(pos_dvs2_t, pos_dvs2_x_smooth, '-r')
-    p3.set_title('DVS movement')
-    p3.set_xlabel('time [s]')
-    p3.set_ylabel('horizontal position [px]')
+    while query_t[-1] >= ref_t[-10]:
+        query_t = query_t[:-10]
+        query_x = query_x[:-10]
 
-    positions_x     = np.array(positions_x, dtype=float)
-    positions_dvs_x = np.array(positions_dvs_x, dtype=float)
+    # evaluate 'reference' at query positions
+    interp_ref_f = interp1d(ref_t, ref_x, copy=False, assume_sorted=True, kind='quadratic')
+    try:
+        interp_ref_x = interp_ref_f(query_t)
+    except ValueError:
+        print ref_t[0], ref_t[-1]
+        print query_t[0], query_t[-1]
 
-    # normalize positions
-    positions_x       -= np.min(positions_x)
-    positions_dvs_x   -= np.min(positions_dvs_x)
-    pos_dvs2_x_smooth -= np.min(pos_dvs2_x_smooth)
+    if False:
+        p = plt.figure().add_subplot(111)
+        p.plot(query_t, query_x, '.')
+        p.plot(ref_t, ref_x)
+        p.plot(query_t, interp_ref_x, '.')
+        p.legend(['query', 'ref', 'inter'])
+        p.set_title("dot = {}".format(np.dot(query_x, interp_ref_x)))
+        plt.show()
 
-    positions_x       /= np.max(positions_x)
-    positions_dvs_x   /= np.max(positions_dvs_x)
-    pos_dvs2_x_smooth /= np.max(pos_dvs2_x_smooth)
+    #return np.sum(abs(query_x - interp_ref_x))
+    return -np.dot(query_x, interp_ref_x)
 
-    #smooth_dvs_x = smooth(positions_x)[5:-5]
 
-    #positions_t = [t-0.014 for t in positions_t] # estimated offset
+# positions is a dict: name => [(t, x)]
+def correlate_all(positions, max_offset=0.04):
 
-    p4 = plt.figure().add_subplot(111)
-    p4.plot(positions_t, positions_x, marker='.')
-    p4.plot(positions_dvs_t, positions_dvs_x, '.')
-    p4.plot(pos_dvs2_t, pos_dvs2_x_smooth, '.')
-    p4.set_title('unaligned camera trajectories')
-    p4.set_xlabel('time [s]')
-    p4.set_ylabel('horizontal position [normalized from px]')
-    p4.legend(['camera frames', 'events: fixed window integration', 'events: continuous line tracking'])
-    #p4.plot(positions_dvs_t, smooth_dvs_x)
+    t_offsets = np.linspace(-max_offset, max_offset, 1000)
 
-    #fig.tight_layout()
+    with open(os.path.join(PLOT_EXPORT_DIR, 'minima.csv'), 'wb') as filehandle:
+        csv_export = csv.writer(filehandle, delimiter=',')
+        csv_export.writerow(['against'] + list(positions.keys()))
 
-    t_offsets = np.linspace(-0.02, 0.01, 1000)
-    conv = []
 
-    for t_offset in t_offsets:
-        print_progress("correlating position", t_offset, t_offsets[0], t_offsets[-1])
-        conv.append( correlate(zip(positions_t, positions_x), zip(pos_dvs2_t, pos_dvs2_x_smooth), t_offset) )
+        for i, (base_name, (base_t, base_x)) in enumerate(positions.iteritems()):
+            f = plt.figure()
+            p = f.add_subplot(111)
 
-    p5 = plt.figure().add_subplot(111)
-    p5.plot(t_offsets*1000, normalize(conv))
-    p5.set_title('correlation')
-    p5.set_xlabel('time offset [ms]')
-    p5.set_ylabel('error [normalized]')
+            base_x = normalize_avg(base_x)
 
+            names = []
+            minima = []
+            for sub_name, (data_t, data_x) in positions.iteritems():
+                #if sub_name == base_name:
+                    #continue
+                data_x = normalize_avg(data_x)
+
+                if base_name == 'acceleration':
+                    if sub_name != 'acceleration':
+                        # calculate second derivative
+                        data_x = normalize_avg(np.diff(smooth(np.diff(data_x))))
+                        data_t = data_t[1:-1] # derivation cuts of first and last sample
+                elif sub_name == 'acceleration':
+                    minima.append('n/a')
+                    continue
+
+
+                conv = []
+                for t_offset in t_offsets:
+                    print_progress("correlating {} against {}".format(sub_name, base_name), t_offset, t_offsets[0], t_offsets[-1])
+                    #conv.append( correlate(zip(data_t, data_x), zip(base_t, base_x), t_offset) )
+                    conv.append( correlate2(data_t, data_x, base_t, base_x, t_offset) )
+
+                p.plot(t_offsets*1000, normalize(conv))
+                cur_min = t_offsets[np.argmin(conv)]*1000
+                print "min at offset = ", cur_min, "ms"
+                #print "max at offset = ", t_offsets[np.argmax(conv)]*1000, "ms"
+                names.append(sub_name)
+                minima.append(cur_min)
+
+            csv_export.writerow([base_name] + minima)
+
+
+            p.set_title('correlation against {}'.format(base_name))
+            p.set_xlabel('time offset [ms]')
+            p.set_ylabel('error [normalized]')
+            p.legend(names)
+            f.savefig(PLOT_EXPORT_DIR + 'correlation_against_{}.png'.format(base_name), bbox_inches='tight')
+            plt.show(block=False)
+
+    # plot all positions in one plot
+    f = plt.figure()
+    p = f.add_subplot(111)
+    p.set_title('position')
+    names = []
+    for name, (data_t, data_x) in positions.iteritems():
+        p.plot(data_t, normalize_avg(data_x), '.-')
+        names.append(name)
+
+    p.legend(names)
+    p.set_xlabel('time [s]')
+    p.set_ylabel('position [normalized]')
+    f.savefig(PLOT_EXPORT_DIR + 'all_positions.png', bbox_inches='tight')
+
+def correlate_against_acceleration(positions, accel_t, accel_x, max_offset=0.04):
+    t_offsets = np.linspace(-max_offset, max_offset, 200)
+
+    accel_x = normalize_avg(accel_x)
+
+    f = plt.figure()
+    p = f.add_subplot(111)
+    p.set_title('correlation against acceleration')
+    p.set_xlabel('time offset [ms]')
+    p.set_ylabel('error [normalized]')
+    names = []
+    for sub_name, (data_t, data_x) in positions.iteritems():
+        names.append(sub_name)
+
+        # calculate second derivative
+        dd_data_x = normalize_avg(np.diff(smooth(np.diff(data_x))))
+
+        conv = []
+        for t_offset in t_offsets:
+            print_progress("correlating {} against acceleration".format(sub_name), t_offset, t_offsets[0], t_offsets[-1])
+            #conv.append( correlate2(zip(data_t[1:-1], dd_data_x), zip(accel_t, accel_x), t_offset) )
+            conv.append( correlate2(data_t[1:-1], dd_data_x, accel_t, accel_x, t_offset) )
+
+        p.plot(t_offsets*1000, normalize(conv))
+
+        print "min at offset = ", t_offsets[np.argmin(conv)]*1000, "ms"
+        #print "max at offset = ", t_offsets[np.argmax(conv)]*1000, "ms"
+
+    p.legend(names)
+    f.savefig(PLOT_EXPORT_DIR + 'correlation_against_acceleration', bbox_inches='tight')
+
+
+
+
+if __name__ == '__main__':
+
+    t_start = datetime.datetime.now()
+
+    #bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/vert_line_2017-11-20-15-15-39.bag')
+    #bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/synced_vert_line_2017-11-22-15-54-48.bag')
+    #bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/linear_slider/simple_test_2017-12-05-17-52-02.bag')
+    #bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/linear_slider/simple_test2_2017-12-05-18-15-09.bag')
+
+    #bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/linear_slider/nosync_2017-12-09-16-20-31.bag')
+    bag = rosbag.Bag('/home/samuel/rpg_syncsystem_local/bagfiles/linear_slider/linear_slider_sam.bag')
+
+    bridge = CvBridge()
+
+    #fig, ax = plt.subplots()
+
+
+
+    positions_dvs_t, positions_dvs_x = read_dvs_position_by_integration(bag, 'dvs_position_by_integration')
+
+    pos_dvs = load_from_csv(bag, 'event_pos')
+    if pos_dvs is None:
+
+
+        # initialize using one of the first positions calculated using normal method
+        pos_dvs2_t, pos_dvs2_x = track_line_by_events(positions_dvs_x[2], events)
+
+        # remove positions that are likely to be bogus (i.e. no estimate before or after 50ms)
+        clean_event_positions(pos_dvs2_t, pos_dvs2_x)
+
+        save_to_csv(bag, 'event_pos', zip(pos_dvs2_t, pos_dvs2_x))
+    else:
+        pos_dvs2_t = pos_dvs[0]
+        pos_dvs2_x = pos_dvs[1]
 
     
-    camera_accel = normalize(np.diff(smooth(np.diff(positions_x))))
-    accel_y = 1-normalize(accel_y) # IMU appearantly looks in the other direction ;)
-
-    p = plt.figure().add_subplot(111)
-    p.plot(positions_t[1:], normalize(np.diff(positions_x)))
-    p.plot(positions_t[1:-1], camera_accel)
-    p.plot(accel_t, accel_y)
-    p.set_xlabel('time [s]')
-    p.set_ylabel('acceleration / velocity [normalized]')
-
-    p.legend(['camera velocity', 'camera acceleration', 'measured acceleration'])
-
+    positions = OrderedDict([
+        ("linear slider",                   read_slider_positions(bag, '/linear_slider_ros_interface/pose')),
+        ("BlueFox camera",                  read_image_positions(bag, '/camera/image_raw',              VERT_POS,       (MIN_HORIZ_CAM, MAX_HORIZ_CAM))),
+        ("BlueFox camera (synchronized)",   read_image_positions(bag, '/synchronized/camera/image_raw', VERT_POS,       (MIN_HORIZ_CAM, MAX_HORIZ_CAM))),
+        ("DAVIS camera",                    read_image_positions(bag, '/dvs/image_raw',                 VERT_POS_DVS,   (MIN_HORIZ_DVS, MAX_HORIZ_DVS))),
+        ("DAVIS events (integrated)",       (positions_dvs_t, positions_dvs_x)),
+        ("DAVIS events (tracker, smoothed)", (pos_dvs2_t, smooth(np.array(pos_dvs2_x), window_len=101))),
+        ("acceleration",                    read_acceleration(bag, '/dvs/imu')),
+        #("DAVIS events",                    (pos_dvs2_t, pos_dvs2_x)),
+    ])
 
 
-    conv = []
-    for t_offset in t_offsets:
-        print_progress("correlating acceleration", t_offset, t_offsets[0], t_offsets[-1])
-        conv.append( correlate(zip(positions_t[1:-1], camera_accel), zip(accel_t, accel_y), t_offset) )
+    #accel_t, accel_y = read_acceleration(bag)
+    #correlate_against_acceleration(positions, accel_t, accel_y)
+    #plt.show(block=False)
 
-    p5.plot(t_offsets*1000, normalize(conv))
-    p5.legend(['position', 'acceleration'])
+    correlate_all(positions)
 
     bag.close()
+
+    total_t = datetime.datetime.now() - t_start
+    print "analysis took", total_t
+
     plt.show()

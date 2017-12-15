@@ -15,9 +15,6 @@ import message_filters
 
 
 
-# TODO: prevent changes to exposure time while waiting for previous change
-
-
 ################################################################################
 # Helper Functions
 
@@ -110,6 +107,7 @@ class ExpTimeSynchronizator:
     #---------------------------------------------------------------------------
     # a frame starts with a rising event and ends with a falling event
     # in the case of a DVS or normal DAVIS this is inverted by the sync circuitry
+    # TODO: how to handle missing events? incorporate pll!
 
     def special_event_callback(self, event):
         with self.mutex:
