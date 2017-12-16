@@ -37,7 +37,7 @@ DVS_WIDTH = 350 # 240 for DAVIS
 EVENT_HIST_WINDOW_SIZE = rospy.Duration.from_sec(0.01)
 EVENT_HIST_WINDOW_INC  = rospy.Duration.from_sec(0.002)
 
-PLOT_EXPORT_DIR = '/home/samuel/sync/ETH/Master/Semester 3/syncsystem/plots/long_recording/multiplication/'
+PLOT_EXPORT_DIR = '/home/samuel/sync/ETH/Master/Semester 3/syncsystem/plots/long_recording/L2/'
 
 ################################################################################
 # Helper Functions
@@ -301,20 +301,34 @@ def track_line_by_events(initial_pos_estimate, events, window_size=20, max_dist=
 
     for event in events:
         if abs(last_pos - event.x) < max_dist: # close enough?
+
             local_buffer.append(event)
 
             if len(local_buffer) < window_size:
                 # not enough events, collect some more
                 continue
 
+            # restart tracking after a long gap
+            while event.ts - local_buffer[0].ts > rospy.Duration.from_sec(0.05):
+                del local_buffer[0]
+
+            if len(local_buffer) < window_size:
+                # not enough events, collect some more
+                continue
+
+
+            # use average timestamp
             pos_t.append(np.average([e.ts.to_sec()-bag.get_start_time() for e in local_buffer]))
+
+            # use latest timestamp
+            #pos_t.append(event.ts.to_sec()-bag.get_start_time())
 
             last_pos = np.average([e.x for e in local_buffer])
             pos_x.append(last_pos)
 
             del local_buffer[0] # throw out old events
 
-    assert len(local_buffer) == window_size-1
+    #assert len(local_buffer) == window_size-1
 
     return pos_t, pos_x
 
@@ -427,8 +441,7 @@ def read_slider_positions(bag, topic='/linear_slider_ros_interface/pose'):
     return times, pos
 
 @cache_in_csv
-def read_dvs_position_by_integration(bag, topic): # topic is not used in here, but cache_in_csv requires it
-    events = read_events_cached(bag)
+def read_dvs_position_by_integration(bag, topic, events): # topic is not used in here, but cache_in_csv requires it
 
     positions_dvs_x = []
     positions_dvs_t = []
@@ -530,6 +543,29 @@ def clean_event_positions(times, positions, max_deltaT=0.05):
                 i -= 1
         i+=1
 
+def remove_samples_where_dvs_doesnt_track(cam_t_list, dvs_t_list, limit = 0.01):
+    good = []
+
+    dvs_t_iter = iter(dvs_t_list)
+    
+    try:
+        dvs_t = next(dvs_t_iter)
+        prev_dvs_t = dvs_t
+        for cam_t in cam_t_list:
+            # find events before and after camera frame
+            while dvs_t < cam_t:
+                prev_dvs_t = dvs_t
+                dvs_t = next(dvs_t_iter)
+
+            good.append( cam_t - prev_dvs_t < limit and dvs_t - cam_t < limit )
+
+    except StopIteration:
+        pass
+
+    good.extend([False] * (len(cam_t_list)-len(good)))
+
+    return good
+
 
 def correlate(camera_pos, dvs_pos, t_offset):
 
@@ -567,8 +603,12 @@ def correlate(camera_pos, dvs_pos, t_offset):
 
 def correlate2(query_t, query_x, ref_t, ref_x, t_offset):
 
-    query_t = [t+t_offset for t in query_t]
+    query_t = np.array([t+t_offset for t in query_t])
+    query_x = np.array(query_x)
+    ref_x = np.array(ref_x)
+    ref_t = np.array(ref_t)
 
+    """
     # cut query points so that we're not going outside reference values
     query_t = query_t[10:-10]
     query_x = query_x[10:-10]
@@ -580,11 +620,21 @@ def correlate2(query_t, query_x, ref_t, ref_x, t_offset):
     while query_t[-1] >= ref_t[-10]:
         query_t = query_t[:-10]
         query_x = query_x[:-10]
+    """
 
     # evaluate 'reference' at query positions
-    interp_ref_f = interp1d(ref_t, ref_x, copy=False, assume_sorted=True, kind='quadratic')
+    interp_ref_f = interp1d(ref_t, ref_x, copy=False, assume_sorted=True, kind='quadratic', bounds_error=False, fill_value=float('NaN'))
+
     try:
         interp_ref_x = interp_ref_f(query_t)
+
+        tmp = [(x1,x2,t) for x1,x2,t in zip(interp_ref_x, query_x, query_t) if not np.isnan(x1)]
+        r = len(query_x)-len(tmp)
+
+        interp_ref_x = np.array([x1 for x1,x2,t in tmp])
+        query_x      = np.array([x2 for x1,x2,t in tmp])
+        query_t      = np.array([t  for x1,x2,t in tmp])
+
     except ValueError:
         print ref_t[0], ref_t[-1]
         print query_t[0], query_t[-1]
@@ -598,8 +648,9 @@ def correlate2(query_t, query_x, ref_t, ref_x, t_offset):
         p.set_title("dot = {}".format(np.dot(query_x, interp_ref_x)))
         plt.show()
 
-    #return np.sum(abs(query_x - interp_ref_x))
-    return -np.dot(query_x, interp_ref_x)
+    return np.sum(np.array(query_x - interp_ref_x)**2) / len(query_x) # L2
+    #return np.sum(abs(query_x - interp_ref_x)) # L1
+    #return -np.dot(query_x, interp_ref_x) # multiplication
 
 
 # positions is a dict: name => [(t, x)]
@@ -672,8 +723,9 @@ def correlate_all(positions, max_offset=0.04):
     p.set_ylabel('position [normalized]')
     f.savefig(PLOT_EXPORT_DIR + 'all_positions.png', bbox_inches='tight')
 
+"""
 def correlate_against_acceleration(positions, accel_t, accel_x, max_offset=0.04):
-    t_offsets = np.linspace(-max_offset, max_offset, 200)
+    t_offsets = np.linspace(-max_offset, max_offset, 100)
 
     accel_x = normalize_avg(accel_x)
 
@@ -702,11 +754,15 @@ def correlate_against_acceleration(positions, accel_t, accel_x, max_offset=0.04)
 
     p.legend(names)
     f.savefig(PLOT_EXPORT_DIR + 'correlation_against_acceleration', bbox_inches='tight')
+    """
 
 
 
 
 if __name__ == '__main__':
+
+    # use nicer colors
+    plt.style.use('seaborn-talk') # larger!
 
     t_start = datetime.datetime.now()
 
@@ -721,10 +777,11 @@ if __name__ == '__main__':
     bridge = CvBridge()
 
     #fig, ax = plt.subplots()
+    camera_synced_t, camera_synced_x = read_image_positions(bag, '/synchronized/camera/image_raw', VERT_POS,       (MIN_HORIZ_CAM, MAX_HORIZ_CAM))
 
+    events = read_events_cached(bag)
 
-
-    positions_dvs_t, positions_dvs_x = read_dvs_position_by_integration(bag, 'dvs_position_by_integration')
+    positions_dvs_t, positions_dvs_x = read_dvs_position_by_integration(bag, 'dvs_position_by_integration', events)
 
     pos_dvs = load_from_csv(bag, 'event_pos')
     if pos_dvs is None:
@@ -736,21 +793,28 @@ if __name__ == '__main__':
         # remove positions that are likely to be bogus (i.e. no estimate before or after 50ms)
         clean_event_positions(pos_dvs2_t, pos_dvs2_x)
 
+        plt.plot(pos_dvs2_t, pos_dvs2_x, '.-')
+        plt.show()
+
         save_to_csv(bag, 'event_pos', zip(pos_dvs2_t, pos_dvs2_x))
     else:
         pos_dvs2_t = pos_dvs[0]
         pos_dvs2_x = pos_dvs[1]
 
+    good = remove_samples_where_dvs_doesnt_track(camera_synced_t, pos_dvs2_t)
+    filtered_camera_synced_t = np.array(camera_synced_t)[good]
+    filtered_camera_synced_x = np.array(camera_synced_x)[good]
     
     positions = OrderedDict([
-        ("linear slider",                   read_slider_positions(bag, '/linear_slider_ros_interface/pose')),
-        ("BlueFox camera",                  read_image_positions(bag, '/camera/image_raw',              VERT_POS,       (MIN_HORIZ_CAM, MAX_HORIZ_CAM))),
-        ("BlueFox camera (synchronized)",   read_image_positions(bag, '/synchronized/camera/image_raw', VERT_POS,       (MIN_HORIZ_CAM, MAX_HORIZ_CAM))),
-        ("DAVIS camera",                    read_image_positions(bag, '/dvs/image_raw',                 VERT_POS_DVS,   (MIN_HORIZ_DVS, MAX_HORIZ_DVS))),
-        ("DAVIS events (integrated)",       (positions_dvs_t, positions_dvs_x)),
-        ("DAVIS events (tracker, smoothed)", (pos_dvs2_t, smooth(np.array(pos_dvs2_x), window_len=101))),
-        ("acceleration",                    read_acceleration(bag, '/dvs/imu')),
-        #("DAVIS events",                    (pos_dvs2_t, pos_dvs2_x)),
+        #("linear slider",                   read_slider_positions(bag, '/linear_slider_ros_interface/pose')),
+        #("BlueFox camera",                  read_image_positions(bag, '/camera/image_raw',              VERT_POS,       (MIN_HORIZ_CAM, MAX_HORIZ_CAM))),
+        ("BlueFox camera (synchronized)",    (camera_synced_t, camera_synced_x)),
+        ("BlueFox camera (filtered)",    (filtered_camera_synced_t, filtered_camera_synced_x)),
+        #("DAVIS camera",                    read_image_positions(bag, '/dvs/image_raw',                 VERT_POS_DVS,   (MIN_HORIZ_DVS, MAX_HORIZ_DVS))),
+        #("DAVIS events (integrated)",       (positions_dvs_t, positions_dvs_x)),
+        #("DAVIS events (tracker, smoothed)", (pos_dvs2_t, smooth(np.array(pos_dvs2_x), window_len=101))),
+        #("acceleration",                    read_acceleration(bag, '/dvs/imu')),
+        ("DAVIS events (tracker)",          (pos_dvs2_t, pos_dvs2_x)),
     ])
 
 
