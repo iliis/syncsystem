@@ -20,16 +20,21 @@ import scipy as sp
 
 from scipy.interpolate import interp1d
 
+import matplotlib
+matplotlib.rcParams["savefig.directory"] = "/home/samuel/sync/ETH/Master/Semester 3/syncsystem/plots/"
 
 
 VERT_POS = 255
-VERT_POS_DVS = 160
+VERT_POS_DVS = 160 # for DAVIS APS
 
 MIN_HORIZ_CAM = 260
 MAX_HORIZ_CAM = 520
 
+# for events
 MIN_HORIZ_DVS = 36
 MAX_HORIZ_DVS = 320
+MIN_VERT_DVS = 50
+MAX_VERT_DVS = 230
 
 DVS_WIDTH = 350 # 240 for DAVIS
 
@@ -37,7 +42,10 @@ DVS_WIDTH = 350 # 240 for DAVIS
 EVENT_HIST_WINDOW_SIZE = rospy.Duration.from_sec(0.01)
 EVENT_HIST_WINDOW_INC  = rospy.Duration.from_sec(0.002)
 
-PLOT_EXPORT_DIR = '/home/samuel/sync/ETH/Master/Semester 3/syncsystem/plots/long_recording/L2/'
+PLOT_EXPORT_DIR = '/home/samuel/sync/ETH/Master/Semester 3/syncsystem/plots/long_recording/tmp/'
+
+# offsets to try and measure
+CORRELATION_WINDOW = np.linspace(-0.04, 0.04, 201)
 
 ################################################################################
 # Helper Functions
@@ -278,18 +286,20 @@ def read_events_cached(bag):
         #event_buffer.extend(msg.events)
 
         for event in msg.events:
-            if VERT_POS_DVS-10 < event.y < VERT_POS_DVS+10: # we're only interested in a single row
+            if MIN_VERT_DVS < event.y < MAX_VERT_DVS: # we're only interested in a part of the frame
             #if event.y == VERT_POS_DVS:
                 event_buffer.append(Event(event.x, event.y, event.polarity, event.ts))
 
     with open(hashed_filename, 'wb') as f:
+        print "writing events to", hashed_filename, "..."
         pickle.dump(event_buffer, f, -1)
+        print "done"
 
     return event_buffer
 
 
 
-def track_line_by_events(initial_pos_estimate, events, window_size=20, max_dist=10):
+def track_line_by_events(initial_pos_estimate, events, window_size=100, max_dist=10):
     assert len(events) > 100
 
     local_buffer = []
@@ -363,8 +373,8 @@ def read_acceleration(bag, topic = '/dvs/imu'):
 
     return accel_t, accel_y
 
-@cache_in_csv
-def read_image_positions(bag, topic, vert_pos, horiz_range):
+#@cache_in_csv
+def read_image_positions(bag, topic, vert_pos, horiz_range, method='cluster'):
 
     positions_x = []
     positions_t = []
@@ -381,8 +391,12 @@ def read_image_positions(bag, topic, vert_pos, horiz_range):
         # sum it vertically to reduce noise
         line = np.sum( cv_image[vert_pos-10:vert_pos+10, horiz_range[0]:horiz_range[1]], axis=0 )
 
-        #pos  = find_edge(line)
-        pos, cl_pos = find_edge_by_clustering(line)
+        if method == 'gradient':
+            pos  = find_edge(line)
+        elif method == 'cluster':
+            pos, cl_pos = find_edge_by_clustering(line)
+        else:
+            raise ValueError("invalid method: {}".format(method))
 
         if False and t.to_sec() - bag.get_start_time() > 47:
             diff = np.ediff1d(line)
@@ -654,9 +668,9 @@ def correlate2(query_t, query_x, ref_t, ref_x, t_offset):
 
 
 # positions is a dict: name => [(t, x)]
-def correlate_all(positions, max_offset=0.04):
+def correlate_all(positions):
 
-    t_offsets = np.linspace(-max_offset, max_offset, 1000)
+    t_offsets = CORRELATION_WINDOW
 
     with open(os.path.join(PLOT_EXPORT_DIR, 'minima.csv'), 'wb') as filehandle:
         csv_export = csv.writer(filehandle, delimiter=',')
@@ -674,7 +688,7 @@ def correlate_all(positions, max_offset=0.04):
             for sub_name, (data_t, data_x) in positions.iteritems():
                 #if sub_name == base_name:
                     #continue
-                data_x = normalize_avg(data_x)
+                #data_x = normalize_avg(data_x)
 
                 if base_name == 'acceleration':
                     if sub_name != 'acceleration':
@@ -715,7 +729,8 @@ def correlate_all(positions, max_offset=0.04):
     p.set_title('position')
     names = []
     for name, (data_t, data_x) in positions.iteritems():
-        p.plot(data_t, normalize_avg(data_x), '.-')
+        #p.plot(data_t, normalize_avg(data_x), '.-')
+        p.plot(data_t, data_x, '.-')
         names.append(name)
 
     p.legend(names)
@@ -724,8 +739,8 @@ def correlate_all(positions, max_offset=0.04):
     f.savefig(PLOT_EXPORT_DIR + 'all_positions.png', bbox_inches='tight')
 
 """
-def correlate_against_acceleration(positions, accel_t, accel_x, max_offset=0.04):
-    t_offsets = np.linspace(-max_offset, max_offset, 100)
+def correlate_against_acceleration(positions, accel_t, accel_x):
+    t_offsets = CORRELATION_WINDOW
 
     accel_x = normalize_avg(accel_x)
 
@@ -804,17 +819,37 @@ if __name__ == '__main__':
     good = remove_samples_where_dvs_doesnt_track(camera_synced_t, pos_dvs2_t)
     filtered_camera_synced_t = np.array(camera_synced_t)[good]
     filtered_camera_synced_x = np.array(camera_synced_x)[good]
+
+
+
+    # plot all positions in one plot
+    f = plt.figure()
+    p = f.add_subplot(111)
+    p.set_title('position')
+    p.plot(pos_dvs2_t, pos_dvs2_x, '-')
+
+    p.set_xlabel('time [s]')
+    p.set_ylabel('position [px]')
+
+    plt.show()
+
+
+
+
     
     positions = OrderedDict([
         #("linear slider",                   read_slider_positions(bag, '/linear_slider_ros_interface/pose')),
-        #("BlueFox camera",                  read_image_positions(bag, '/camera/image_raw',              VERT_POS,       (MIN_HORIZ_CAM, MAX_HORIZ_CAM))),
-        ("BlueFox camera (synchronized)",    (camera_synced_t, camera_synced_x)),
-        ("BlueFox camera (filtered)",    (filtered_camera_synced_t, filtered_camera_synced_x)),
+        ("BlueFox camera (max gradient)",
+            read_image_positions(bag, '/camera/image_raw', VERT_POS, (MIN_HORIZ_CAM, MAX_HORIZ_CAM), method='gradient')),
+        ("BlueFox camera (clustering)",
+            read_image_positions(bag, '/camera/image_raw', VERT_POS, (MIN_HORIZ_CAM, MAX_HORIZ_CAM), method='cluster')),
+        #("BlueFox camera (synchronized)",    (camera_synced_t, camera_synced_x)),
+        #("BlueFox camera (filtered)",    (filtered_camera_synced_t, filtered_camera_synced_x)),
         #("DAVIS camera",                    read_image_positions(bag, '/dvs/image_raw',                 VERT_POS_DVS,   (MIN_HORIZ_DVS, MAX_HORIZ_DVS))),
         #("DAVIS events (integrated)",       (positions_dvs_t, positions_dvs_x)),
         #("DAVIS events (tracker, smoothed)", (pos_dvs2_t, smooth(np.array(pos_dvs2_x), window_len=101))),
         #("acceleration",                    read_acceleration(bag, '/dvs/imu')),
-        ("DAVIS events (tracker)",          (pos_dvs2_t, pos_dvs2_x)),
+        #("DAVIS events (tracker)",          (pos_dvs2_t, pos_dvs2_x)),
     ])
 
 

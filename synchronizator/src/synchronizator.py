@@ -45,7 +45,8 @@ def floor_rest(f):
 ################################################################################
 
 class FrameMeasurement:
-    def __init__(self, ts, exp_time, is_estimated=False):
+    def __init__(self, ts, exp_time, is_estimated=False, seq=None):
+        self.seq      = seq
         self.ts       = ts
         self.exp_time = exp_time
         self.is_estimated = is_estimated
@@ -84,10 +85,10 @@ class ExpTimeSynchronizator:
         # and any holes are filled by estimating the parameters of the missing
         # frame
         self.frame_queue = []
-        self.last_frame_seq = 0
+        self.last_frame_seq = 0 # frames are numbered incrementally, matching images to special events happens through this
 
         self.mutex = threading.Lock()
-        self.got_new_data = threading.Event()
+        self.got_new_image = threading.Event()
 
         rospy.init_node('event_visualizer', anonymous=True)
 
@@ -182,24 +183,12 @@ class ExpTimeSynchronizator:
                 return
 
             self.image_queue.append( (info, img) )
-            self.got_new_data.set()
+            self.got_new_image.set()
 
     ############################################################################
     # PLL THREAD
     # handles special events and collates them into frames
     # estimates frames if events are missing
-
-    def emit_frame_internally(self, frame):
-        pass
-
-    #---------------------------------------------------------------------------
-
-    def sleep_until(self, t):
-        # allow some slack, i.e. rather wait a bit too short
-        while rospy.Time.now() + rospy.Duration(secs=0, nsecs=10000) < t:
-            rospy.sleep(t - rospy.Time.now())
-
-    #---------------------------------------------------------------------------
 
     def event_pll(self):
 
@@ -267,6 +256,8 @@ class ExpTimeSynchronizator:
             )
 
         #frame = FrameMeasurement(frame_t, exp_time, estimated)
+        frame.seq = self.last_frame_seq
+        self.last_frame_seq += 1
 
         self.frame_queue.append(frame)
 
@@ -332,7 +323,7 @@ class ExpTimeSynchronizator:
         self.sync_state = 'wait_data'
         rospy.loginfo("SYNCSTATE: {}".format(self.sync_state))
 
-        self.got_new_data.clear()
+        self.got_new_image.clear()
 
     #---------------------------------------------------------------------------
 
@@ -624,13 +615,13 @@ class ExpTimeSynchronizator:
     # main state-machine
     def main(self):
         while not rospy.is_shutdown():
-            self.got_new_data.wait(timeout=self.TIMEOUT.to_sec())
-            if not self.got_new_data.is_set():
+            self.got_new_image.wait(timeout=self.TIMEOUT.to_sec())
+            if not self.got_new_image.is_set():
                 rospy.logwarn("Timeout in main thread while waiting for data.")
                 continue
 
             with self.mutex:
-                self.got_new_data.clear()
+                self.got_new_image.clear()
 
                 if self.sync_state == 'wait_data':
                     # we're waiting for data from both cameras
