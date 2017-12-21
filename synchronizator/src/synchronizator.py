@@ -1,11 +1,8 @@
 #!/usr/bin/env python
 
-import random
-
 import datetime
 import math
 import threading
-from enum import Enum
 import numpy as np
 
 import rospy
@@ -16,9 +13,6 @@ from bluefox_ros.msg import CaptureInfo
 from std_srvs.srv import Trigger, TriggerResponse
 import message_filters
 
-# Note: this code only ever works with special events (rising and falling
-# edges) and never with normal events (brighter/darker). Thus, special events
-# are just called 'events' throughout this code!
 
 
 ################################################################################
@@ -45,10 +39,10 @@ def floor_rest(f):
 ################################################################################
 
 class FrameMeasurement:
-    def __init__(self, ts, exp_time, is_estimated=False):
+    def __init__(seq, ts, exp_time, is_estimate=False):
+        self.seq      = seq
         self.ts       = ts
         self.exp_time = exp_time
-        self.is_estimated = is_estimated
 
 ################################################################################
 
@@ -57,34 +51,19 @@ class ExpTimeSynchronizator:
     # PARAMETERS
     #############################################
 
-    TOLERANCE = rospy.Duration.from_sec(0.0001) # difference between reported/configured exposure time and that measured by DAVIS is quite significant
+    TOLERANCE_US = 100 # [us] difference between reported/configured exposure time and that measured by DAVIS is quite significant
 
     EXP_TIME_DELTA_US = 1000 # [us] change exposure time by this amount to identify frames
 
     TIMEOUT = rospy.Duration.from_sec(2) # timeout for waiting for data/synchronized frames etc.
 
-    MISSING_EVENT_TIMEOUT = rospy.Duration.from_sec(0.2) # wait at least this long before publishing estimated events
+    MISSING_EVENT_TIMEOUT = rospy.Duration.from_sec(0.02) # wait at least this long before publishing estimated events
 
-    OFFSET_HISTORY_SIZE = 30 # keep offset of last N image-frames to detect dropped frames and such
-
-    PLL_QUEUE_LEN = 30 # keep timing of last N event-frames to estimate parameters of missing events
+    OFFSET_HISTORY_SIZE = 30 # keep offset of last N frames to detect dropped frames and such
 
     #---------------------------------------------------------------------------
 
     def __init__(self):
-
-        # store measured frames (measured from special events) in here
-        # these may contain holes tough, when events were lost!
-        self.raw_frame_queue = []
-        self.raw_frame_queue_mutex   = threading.Lock()
-        self.raw_frame_queue_changed = threading.Event()
-        self.last_event_received = None
-
-        # raw frames from the raw_frame_queue are transfered into this queue
-        # and any holes are filled by estimating the parameters of the missing
-        # frame
-        self.frame_queue = []
-        self.last_frame_seq = 0
 
         self.mutex = threading.Lock()
         self.got_new_data = threading.Event()
@@ -109,7 +88,7 @@ class ExpTimeSynchronizator:
         self.camera_image_sub = message_filters.Subscriber("/camera/image_raw", Image, queue_size=None)
 
         self.synced_cam_info = message_filters.TimeSynchronizer([self.capture_info_sub, self.camera_image_sub], 10)
-        #self.synced_cam_info.registerCallback(self.image_callback)
+        self.synced_cam_info.registerCallback(self.image_callback)
 
 
         self.capt_info_pub = rospy.Publisher("/synchronized/camera/capture_info", CaptureInfo, queue_size=0)
@@ -118,7 +97,7 @@ class ExpTimeSynchronizator:
 
         self.original_exp_time = None
 
-        rospy.Service('resynchronize', Trigger, self.start_synchronization)
+        #rospy.Service('resynchronize', Trigger, self.start_synchronization)
 
         self.timeout_timer = None
 
@@ -144,27 +123,57 @@ class ExpTimeSynchronizator:
     # TODO: how to handle missing events? incorporate pll!
 
     def special_event_callback(self, event):
-        with self.raw_frame_queue_mutex:
+        with self.mutex:
+
+            if self.last_sevent_seq is not None:
+                if event.header.seq != self.last_sevent_seq+1:
+                    rospy.logerr("Non-consecutive special event messages received!")
+
+            self.last_sevent_seq = event.header.seq
+
             if self.invert_special_events:
                 event.polarity = not event.polarity
 
-            good = True
             if self.last_event is not None:
-                if event.header.seq != self.last_event.header.seq+1:
-                    rospy.logwarn("Non-consecutive special event messages received!")
-                    good = False
-                if event.polarity == self.last_event.polarity:
-                    rospy.logwarn("got two consecutive special events with {} edge, this should not happen".format(\
-                            "rising" if event.polarity else "falling"))
-                    good = False
 
-                if event.polarity == False and good:
-                    exp_time = event.ts - self.last_event.ts
-                    self.raw_frame_queue.append(FrameMeasurement(event.ts + exp_time/2, exp_time))
-                    self.raw_frame_queue_changed.set()
+                if event.polarity == self.last_event.polarity:
+                    rospy.logerr("got two consecutive special events with {} edge, this should not happen".format(\
+                            "rising" if event.polarity else "falling"))
+                    #self.reset_sync()
+                    #return
+
+            if event.polarity == True:
+
+                if self.last_event is not None and self.last_event.polarity == True and self.time_offset_hist_idx >= 0:
+                    # we've missed a falling event!
+                    duration = np.median([h[2] for h in self.time_offset_hist]) # guess duration
+                    stamp    = self.last_rising.ts + duration/2 # middle of frame
+                    self.special_events.append( (stamp, duration, int(math.floor((self.last_rising.header.seq+1)/2))) ) # sequence number might be bullshit
+                    self.got_new_data.set()
+                    rospy.logwarn("inserting a guess for the missed falling event")
+
+
+                self.last_rising = event
+
+            else:
+
+                if self.last_event is not None and self.last_event.polarity == False and self.time_offset_hist_idx >= 0:
+                    # we've missed a falling event, use current framerate instead to guess where it was
+                    duration = np.median([h[2] for h in self.time_offset_hist])
+                    rospy.logwarn("inserting a guess for the missed rising event")
+                elif self.last_rising is not None:
+                    duration = event.ts - self.last_rising.ts
+                else:
+                    rospy.logwarn("ignoring falling edge event: no rising edge")
+                    return
+
+                stamp    = event.ts - duration/2 # middle of frame
+
+                self.last_rising = None
+                self.special_events.append( (stamp, duration, int(math.floor(event.header.seq/2))) )
+                self.got_new_data.set()
 
             self.last_event = event
-
 
     #---------------------------------------------------------------------------
 
@@ -183,123 +192,6 @@ class ExpTimeSynchronizator:
 
             self.image_queue.append( (info, img) )
             self.got_new_data.set()
-
-    ############################################################################
-    # PLL THREAD
-    # handles special events and collates them into frames
-    # estimates frames if events are missing
-
-    def emit_frame_internally(self, frame):
-        pass
-
-    #---------------------------------------------------------------------------
-
-    def sleep_until(self, t):
-        # allow some slack, i.e. rather wait a bit too short
-        while rospy.Time.now() + rospy.Duration(secs=0, nsecs=10000) < t:
-            rospy.sleep(t - rospy.Time.now())
-
-    #---------------------------------------------------------------------------
-
-    def event_pll(self):
-
-        self.pll_is_locked = False
-        self.pll_est_frame_t = None # phase (time of current frame)
-        self.pll_est_inter_frame_duration = None # frequency
-        self.pll_est_exposure_time = None
-        self.pll_queue = []
-
-        while not rospy.is_shutdown():
-            # wait until we should publish our next image
-            # TODO: consider using rospy.Rate()
-            # TODO: sleep for MISSING_EVENT_TIMEOUT when we haven't gotten any matching events already
-
-            # wait for more data
-            if len(self.raw_frame_queue) == 0:
-                self.raw_frame_queue_changed.clear()
-                if not self.raw_frame_queue_changed.wait(timeout=self.TIMEOUT.to_sec()):
-                    rospy.logfatal("timeout in PLL thread while waiting for special events")
-
-
-            with self.raw_frame_queue_mutex, self.mutex:
-
-                if not self.pll_is_locked:
-                    self.enqueue_frame(self.raw_frame_queue[0])
-                    del self.raw_frame_queue[0]
-                else:
-                    # look for good frames in event stream
-                    for i in range(len(self.raw_frame_queue)):
-                        if abs(self.raw_frame_queue[i].ts - self.pll_est_frame_t) <= self.pll_est_inter_frame_duration/2:
-
-                            if i > 0:
-                                rospy.logwarn("ignoring {} measured frames".format(i))
-
-                            self.enqueue_frame(self.raw_frame_queue[i])
-
-                            # throw away events we've used
-                            del self.raw_frame_queue[:i+1]
-                            break
-                    else:
-                        # throw away real frames that are older than what we estimated just now
-                        for i, frame in enumerate(self.raw_frame_queue):
-                            if frame.ts >= self.pll_est_frame_t:
-                                break
-
-                        if i > 0:
-                            rospy.loginfo("ignoring {} measured frames which are older than current estimate".format(i))
-                            del self.raw_frame_queue[i]
-
-                        # no match found, estimate something instead
-                        self.enqueue_frame(FrameMeasurement(self.pll_est_frame_t, self.pll_est_inter_frame_duration, is_estimated=True))
-
-
-    #---------------------------------------------------------------------------
-
-    def enqueue_frame(self, frame):
-
-        if frame.is_estimated:
-            rospy.logwarn("publishing image based on estimation: t={}, exposure time={}ms".format(frame.ts, frame.exp_time.to_sec()*1000))
-        elif self.pll_is_locked:
-            rospy.loginfo("offset: of estimate: {:7.3f}ms, actual: {:7.3f}ms"\
-                .format(\
-                (frame.ts - self.pll_est_frame_t).to_sec()*1000,
-                (frame.ts - rospy.Time.now()).to_sec()*1000 )
-            )
-
-        #frame = FrameMeasurement(frame_t, exp_time, estimated)
-
-        self.frame_queue.append(frame)
-
-        self.update_pll(frame)
-
-    #---------------------------------------------------------------------------
-
-    def update_pll(self, frame):
-
-        actual_length = len([f for f in self.pll_queue if not f.is_estimated])
-
-        if actual_length == self.PLL_QUEUE_LEN-1:
-            print "got", self.PLL_QUEUE_LEN, "frames, syncstate: running"
-
-        self.pll_queue.append(frame)
-        if actual_length > self.PLL_QUEUE_LEN:
-            del self.pll_queue[0] # TODO: use ring-buffer instead of appending/deleting
-
-            # estimate exposure time
-            # TODO: use average (numpy can't handle duration tough)
-            self.pll_est_exposure_time = np.median([f.exp_time for f in self.pll_queue if not f.is_estimated])
-
-            # estimate FPS
-            # TODO: don't use estimated frames here!!!
-            self.pll_est_inter_frame_duration = np.median([B.ts - A.ts for A,B in prevnext(self.pll_queue)])
-            self.pll_est_frame_t = frame.ts + self.pll_est_inter_frame_duration
-
-            self.pll_is_locked = True
-        else:
-            self.pll_is_locked = False
-
-
-
 
     ############################################################################
     # MAIN THREAD
@@ -361,6 +253,8 @@ class ExpTimeSynchronizator:
         self.config = self.configclient.update_configuration({'exp_time': t})
         rospy.loginfo("changed exposure time to {} ms".format(self.config['exp_time']/1000.0))
         self.currently_set_exp_time = self.config['exp_time']
+
+
 
         response = TriggerResponse()
         response.success = True
@@ -677,7 +571,6 @@ class ExpTimeSynchronizator:
 
 if __name__ == "__main__":
     e = ExpTimeSynchronizator()
-    #e.main()
-    e.event_pll()
+    e.main()
 
 ################################################################################
