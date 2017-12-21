@@ -38,14 +38,6 @@ def floor_rest(f):
 
 ################################################################################
 
-class FrameMeasurement:
-    def __init__(seq, ts, exp_time, is_estimate=False):
-        self.seq      = seq
-        self.ts       = ts
-        self.exp_time = exp_time
-
-################################################################################
-
 class ExpTimeSynchronizator:
 
     # PARAMETERS
@@ -53,11 +45,9 @@ class ExpTimeSynchronizator:
 
     TOLERANCE_US = 100 # [us] difference between reported/configured exposure time and that measured by DAVIS is quite significant
 
-    EXP_TIME_DELTA_US = 1000 # [us] change exposure time by this amount to identify frames
+    EXP_TIME_DELTA = 1000 # [us] change exposure time by this amount to identify frames
 
     TIMEOUT = rospy.Duration.from_sec(2) # timeout for waiting for data/synchronized frames etc.
-
-    MISSING_EVENT_TIMEOUT = rospy.Duration.from_sec(0.02) # wait at least this long before publishing estimated events
 
     OFFSET_HISTORY_SIZE = 30 # keep offset of last N frames to detect dropped frames and such
 
@@ -72,10 +62,7 @@ class ExpTimeSynchronizator:
 
 
         self.skip_initial_image_count = rospy.get_param('~skip_first_frames', 0)
-        if self.skip_initial_image_count > 0:
-            rospy.loginfo("skipping initial {} frames".format(self.skip_initial_image_count))
-        else:
-            self.skip_initial_image_count = 0
+        rospy.loginfo("skipping initial {} frames".format(self.skip_initial_image_count))
 
         self.invert_special_events = rospy.get_param('~invert_special_events', False)
 
@@ -242,10 +229,10 @@ class ExpTimeSynchronizator:
         # toggle between two different exposure times
         if self.currently_set_exp_time == self.original_exp_time:
             # use something that isn't too close to the limits (0 or 10ms)
-            if self.currently_set_exp_time < self.EXP_TIME_DELTA_US*2:
-                t = self.currently_set_exp_time + self.EXP_TIME_DELTA_US
+            if self.currently_set_exp_time < self.EXP_TIME_DELTA*2:
+                t = self.currently_set_exp_time + self.EXP_TIME_DELTA
             else:
-                t = self.currently_set_exp_time - self.EXP_TIME_DELTA_US
+                t = self.currently_set_exp_time - self.EXP_TIME_DELTA
         else:
             # go back to original exposure time
             t = self.original_exp_time
